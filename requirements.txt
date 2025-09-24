@@ -2,3 +2,4 @@ streamlit
 smartapi-python
 pyotp
 smartapi
+logzero
