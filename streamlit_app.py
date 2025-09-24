@@ -1,5 +1,5 @@
 import streamlit as st
-from smartapi import SmartConnect
+from smartapi.smartConnect import SmartConnect   # <-- fixed import
 import pyotp
 import time
 from typing import Optional, Dict, Any
@@ -47,7 +47,6 @@ class SmartAPIClient:
 
     def ensure_valid_token(self):
         """(Optional) check validity / expiration and refresh if needed."""
-        # The SDK may throw error on usage if token expired; you can catch and call refresh
         pass
 
     def get_profile(self) -> Dict[str, Any]:
@@ -69,7 +68,6 @@ class SmartAPIClient:
         return self.smart.holding()
 
     def place_order(self, orderparams: dict) -> Any:
-        # returns orderid or full response based on SDK
         return self.smart.placeOrder(orderparams)
 
     def modify_order(self, params: dict) -> Any:
@@ -108,13 +106,12 @@ def main():
     if "api_client" not in st.session_state:
         st.session_state.api_client: Optional[SmartAPIClient] = None
 
-    # Dummy user login (you may replace with real user auth)
+    # Dummy user login (replace with real auth if needed)
     if not st.session_state.user_logged_in:
         st.subheader("Login")
         user_email = st.text_input("Email")
         user_pwd = st.text_input("Password", type="password")
         if st.button("Login"):
-            # Here, validate user via your database / auth system
             if user_email == "test@example.com" and user_pwd == "password":
                 st.session_state.user_logged_in = True
                 st.success("User login successful")
@@ -141,7 +138,7 @@ def main():
                 totp_secret=creds["totp_secret"]
             )
             try:
-                login_resp = cli.login()
+                cli.login()
                 st.session_state.api_client = cli
                 st.success("SmartAPI login successful")
             except Exception as e:
@@ -185,22 +182,19 @@ def main():
         st.subheader("Order / Positions / Holdings")
         if st.button("Show Order Book"):
             try:
-                ob = client.get_order_book()
-                st.json(ob)
+                st.json(client.get_order_book())
             except Exception as e:
                 st.error(f"Error order book: {e}")
 
         if st.button("Show Positions"):
             try:
-                pos = client.get_positions()
-                st.json(pos)
+                st.json(client.get_positions())
             except Exception as e:
                 st.error(f"Error positions: {e}")
 
         if st.button("Show Holdings"):
             try:
-                h = client.get_holdings()
-                st.json(h)
+                st.json(client.get_holdings())
             except Exception as e:
                 st.error(f"Error holdings: {e}")
 
@@ -247,12 +241,10 @@ def main():
         st.subheader("Market / RMS Limits")
         if st.button("Fetch RMS Limits"):
             try:
-                lm = client.get_market_limits()
-                st.json(lm)
+                st.json(client.get_market_limits())
             except Exception as e:
                 st.error(f"Error fetching limits: {e}")
 
-        # (You can also add historical / candle data endpoints etc.)
 
 if __name__ == "__main__":
     main()
