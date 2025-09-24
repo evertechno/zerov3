@@ -1,11 +1,9 @@
 import streamlit as st
 from SmartApi.smartConnect import SmartConnect
 import pyotp
-import time
 from typing import Optional, Dict, Any
 
-# ------------- Utility / SmartAPI wrapper -------------
-
+# ------------- SmartAPI Client Wrapper -------------
 class SmartAPIClient:
     def __init__(self, api_key: str, client_code: str, password: str, totp_secret: str):
         self.api_key = api_key
@@ -20,6 +18,7 @@ class SmartAPIClient:
         self.logged_in = False
 
     def login(self) -> Dict[str, Any]:
+        """Login / generate session using TOTP."""
         totp = pyotp.TOTP(self.totp_secret).now()
         resp = self.smart.generateSession(self.client_code, self.password, totp)
         if not resp.get("status", False):
@@ -27,11 +26,13 @@ class SmartAPIClient:
         data = resp["data"]
         self.jwt_token = data.get("jwtToken")
         self.refresh_token = data.get("refreshToken")
+        # fetch feed token
         self.feed_token = self.smart.getfeedToken()
         self.logged_in = True
         return resp
 
     def refresh(self) -> Dict[str, Any]:
+        """Refresh token using refresh_token."""
         if self.refresh_token is None:
             raise Exception("No refresh token available")
         resp = self.smart.generateToken(self.refresh_token)
@@ -41,9 +42,6 @@ class SmartAPIClient:
         self.jwt_token = data.get("jwtToken")
         self.feed_token = data.get("feedToken")
         return resp
-
-    def ensure_valid_token(self):
-        pass
 
     def get_profile(self) -> Dict[str, Any]:
         return self.smart.getProfile(self.refresh_token)
@@ -79,6 +77,7 @@ class SmartAPIClient:
 # ------------- Streamlit App --------------
 
 def load_credentials_from_secrets():
+    """Load SmartAPI credentials from streamlit secrets."""
     secrets = st.secrets.get("smartapi", None)
     if not secrets:
         st.error("SmartAPI credentials not found in secrets.toml under [smartapi]")
@@ -100,11 +99,13 @@ def main():
     if "api_client" not in st.session_state:
         st.session_state.api_client: Optional[SmartAPIClient] = None
 
+    # Simple user login (replace with actual auth)
     if not st.session_state.user_logged_in:
         st.subheader("Login")
         user_email = st.text_input("Email")
         user_pwd = st.text_input("Password", type="password")
         if st.button("Login"):
+            # Example check — replace with your own user DB
             if user_email == "test@example.com" and user_pwd == "password":
                 st.session_state.user_logged_in = True
                 st.success("User login successful")
@@ -119,6 +120,7 @@ def main():
         st.session_state.api_client = None
         st.experimental_rerun()
 
+    # Initialize SmartAPI client if not yet
     if st.session_state.api_client is None:
         creds = load_credentials_from_secrets()
         if creds:
@@ -169,7 +171,7 @@ def main():
                 st.error(f"Error fetching quote: {e}")
 
     with tab_orders:
-        st.subheader("Order / Positions / Holdings")
+        st.subheader("Orders / Positions / Holdings")
         if st.button("Show Order Book"):
             try:
                 st.json(client.get_order_book())
@@ -234,7 +236,6 @@ def main():
                 st.json(client.get_market_limits())
             except Exception as e:
                 st.error(f"Error fetching limits: {e}")
-
 
 if __name__ == "__main__":
     main()
