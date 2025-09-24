@@ -1002,4 +1002,5 @@ def render_risk_stress_testing_tab(kite_client: KiteConnect | None):
             st.markdown(f"##### Results for Scenario: **{results['scenario_key']}**")
             st.metric("Current Price", f"₹{results['current_price']:.2f}")
             st.metric("Stressed Price", f"₹{results['stressed_price']:.2f}")
-            st.metric("Percentage Change", f"{results['scenario_change_percent']:
+            st.metric("Percentage Change", f"{results['scenario_change_percent']}")
+
