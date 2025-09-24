@@ -1,5 +1,5 @@
 import streamlit as st
-from smartapi.smartConnect import SmartConnect   # <-- fixed import
+from SmartApi.smartConnect import SmartConnect
 import pyotp
 import time
 from typing import Optional, Dict, Any
@@ -20,7 +20,6 @@ class SmartAPIClient:
         self.logged_in = False
 
     def login(self) -> Dict[str, Any]:
-        """Generate session by logging in using TOTP."""
         totp = pyotp.TOTP(self.totp_secret).now()
         resp = self.smart.generateSession(self.client_code, self.password, totp)
         if not resp.get("status", False):
@@ -28,13 +27,11 @@ class SmartAPIClient:
         data = resp["data"]
         self.jwt_token = data.get("jwtToken")
         self.refresh_token = data.get("refreshToken")
-        # The SDK likely automatically sets feedToken internally
         self.feed_token = self.smart.getfeedToken()
         self.logged_in = True
         return resp
 
     def refresh(self) -> Dict[str, Any]:
-        """Refresh JWT / feed token using refresh_token."""
         if self.refresh_token is None:
             raise Exception("No refresh token available")
         resp = self.smart.generateToken(self.refresh_token)
@@ -46,7 +43,6 @@ class SmartAPIClient:
         return resp
 
     def ensure_valid_token(self):
-        """(Optional) check validity / expiration and refresh if needed."""
         pass
 
     def get_profile(self) -> Dict[str, Any]:
@@ -83,7 +79,6 @@ class SmartAPIClient:
 # ------------- Streamlit App --------------
 
 def load_credentials_from_secrets():
-    """Load SmartAPI credentials from streamlit secrets."""
     secrets = st.secrets.get("smartapi", None)
     if not secrets:
         st.error("SmartAPI credentials not found in secrets.toml under [smartapi]")
@@ -100,13 +95,11 @@ def main():
     st.set_page_config(page_title="SmartAPI Dashboard", layout="wide")
     st.title("📈 SmartAPI / Angel Broking Dashboard")
 
-    # Initialize session state
     if "user_logged_in" not in st.session_state:
         st.session_state.user_logged_in = False
     if "api_client" not in st.session_state:
         st.session_state.api_client: Optional[SmartAPIClient] = None
 
-    # Dummy user login (replace with real auth if needed)
     if not st.session_state.user_logged_in:
         st.subheader("Login")
         user_email = st.text_input("Email")
@@ -120,14 +113,12 @@ def main():
                 st.error("Wrong credentials")
         return
 
-    # After user login:
     st.sidebar.success("User logged in")
     if st.sidebar.button("Logout"):
         st.session_state.user_logged_in = False
         st.session_state.api_client = None
         st.experimental_rerun()
 
-    # Initialize SmartAPI client if not yet
     if st.session_state.api_client is None:
         creds = load_credentials_from_secrets()
         if creds:
@@ -149,7 +140,6 @@ def main():
 
     client = st.session_state.api_client
 
-    # Main app tabs
     tab_profile, tab_quotes, tab_orders, tab_market = st.tabs(
         ["Profile", "Quotes", "Orders & Portfolio", "Market Data"]
     )
