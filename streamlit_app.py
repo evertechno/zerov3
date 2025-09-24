@@ -1,8 +1,8 @@
 import streamlit as st
-from kiteconnect import KiteConnect, KiteTicker
+from kiteconnect import KiteConnect
 import pandas as pd
-import json
-import threading
+import json # Still useful for displaying API responses
+import threading # Potentially still useful for async operations if needed later, but removed for now as WebSocket is gone.
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -14,7 +14,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
-# import yfinance as yf  # Removed yfinance dependency - using Zerodha API exclusively
 
 # Supabase imports
 from supabase import create_client, Client
@@ -49,10 +48,7 @@ if "current_calculated_index_data" not in st.session_state: # To store current C
     st.session_state["current_calculated_index_data"] = None
 if "current_calculated_index_history" not in st.session_state: # To store historical index values for plotting
     st.session_state["current_calculated_index_history"] = pd.DataFrame()
-# Removed kt_ticker, kt_thread, kt_running, kt_ticks, kt_live_prices, kt_status_message, _rerun_ws
-# as Websocket (stream) module is removed
-# Removed ws_instrument_token_input, ws_instrument_name as Websocket (stream) module is removed
-# Removed last_found_token, last_found_symbol, last_found_exchange as Instruments Utils module is removed
+# Removed WebSocket-related session state variables
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -214,9 +210,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
 
     num_periods = len(returns_series)
     if num_periods > 0:
-        # Daily average return to annualize correctly
-        avg_daily_return = daily_returns_decimal.mean()
-        annualized_return = ((1 + avg_daily_return)**TRADING_DAYS_PER_YEAR) - 1
+        annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR/num_periods) - 1
     else:
         annualized_return = 0
     annualized_return *= 100 # Convert to percentage
@@ -258,46 +252,19 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     progress_bar_placeholder = st.empty()
     progress_text_placeholder = st.empty()
     
-    # Pre-fetch instruments once for all symbols to reduce API calls for token lookups
-    instruments_df_for_index = load_instruments_cached(api_key, access_token, exchange)
-    if "_error" in instruments_df_for_index.columns:
-        return pd.DataFrame({"_error": [instruments_df_for_index.loc[0, '_error']]})
-
-    total_constituents = len(constituents_df)
     for i, row in constituents_df.iterrows():
         symbol = row['symbol']
-        weight = row['Weights'] # Not directly used in fetching, but good for context
-        progress_text_placeholder.text(f"Fetching historical data for {symbol} ({i+1}/{total_constituents})...")
+        progress_text_placeholder.text(f"Fetching historical data for {symbol} ({i+1}/{len(constituents_df)})...")
         
-        token = find_instrument_token(instruments_df_for_index, symbol, exchange)
-        if not token:
-            st.warning(f"Instrument token not found for {symbol} on {exchange}. Skipping for historical calculation.")
-            progress_bar_placeholder.progress((i + 1) / total_constituents)
-            continue
-
-        # Using the direct kiteconnect client instance for historical data to pass token directly
-        kc_client = get_authenticated_kite_client(api_key, access_token)
-        if not kc_client:
-            st.error("Kite client not authenticated for historical data fetch.")
-            return pd.DataFrame({"_error": ["Kite not authenticated to fetch historical data."]})
-
-        try:
-            from_datetime = datetime.combine(start_date, datetime.min.time())
-            to_datetime = datetime.combine(end_date, datetime.max.time())
-            data = kc_client.historical_data(token, from_date=from_datetime, to_date=to_datetime, interval="day")
-            hist_df = pd.DataFrame(data)
-            if not hist_df.empty:
-                hist_df["date"] = pd.to_datetime(hist_df["date"])
-                hist_df.set_index("date", inplace=True)
-                hist_df.sort_index(inplace=True)
-                hist_df['close'] = pd.to_numeric(hist_df['close'], errors='coerce')
-                hist_df.dropna(subset=['close'], inplace=True)
-                all_historical_closes[symbol] = hist_df['close']
-            else:
-                st.warning(f"No historical data returned for {symbol}.")
-        except Exception as e:
-            st.warning(f"Error fetching historical data for {symbol}: {e}. Skipping.")
-        progress_bar_placeholder.progress((i + 1) / total_constituents)
+        # Use the cached historical data function
+        hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
+        
+        if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
+            all_historical_closes[symbol] = hist_df['close']
+        else:
+            error_msg = hist_df.get('_error', ['Unknown error'])[0] if isinstance(hist_df, pd.DataFrame) else 'Unknown error'
+            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {error_msg}")
+        progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
     progress_text_placeholder.empty()
     progress_bar_placeholder.empty()
@@ -317,13 +284,19 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     # Calculate daily weighted prices
     # Ensure weights are aligned correctly
     # constituents_df should be indexed by 'symbol' for correct alignment
-    # Ensure all symbols in combined_closes have a weight defined
-    valid_symbols = [s for s in combined_closes.columns if s in constituents_df['symbol'].values]
-    if not valid_symbols:
-        return pd.DataFrame({"_error": ["No valid constituent symbols with weights found in historical data."]})
+    
+    # Create a weights series aligned by symbol from constituents_df
+    weights_series = constituents_df.set_index('symbol')['Weights']
+    
+    # Reindex combined_closes columns to match weights_series index
+    # This handles cases where combined_closes might have more symbols, or fewer
+    aligned_combined_closes = combined_closes[weights_series.index.intersection(combined_closes.columns)]
 
-    weights_series = constituents_df.set_index('symbol')['Weights'].reindex(valid_symbols)
-    weighted_closes = combined_closes[valid_symbols].mul(weights_series, axis=1)
+    if aligned_combined_closes.empty:
+        return pd.DataFrame({"_error": ["No common symbols between historical data and constituent weights after alignment."]})
+
+    # Apply weights
+    weighted_closes = aligned_combined_closes.mul(weights_series[aligned_combined_closes.columns], axis=1)
 
     # Sum the weighted prices for each day to get the index value
     index_history_series = weighted_closes.sum(axis=1)
@@ -467,7 +440,7 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 
 
 # --- Main UI - Tabs for modules ---
-# REMOVED "Websocket (stream)" and "Instruments Utils" from the tabs list
+# Removed Websocket and Instrument Lookup tabs
 tabs = st.tabs(["Dashboard", "Portfolio", "Orders", "Market & Historical", "Machine Learning Analysis", "Risk & Stress Testing", "Performance Analysis", "Multi-Asset Analysis", "Custom Index"])
 tab_dashboard, tab_portfolio, tab_orders, tab_market, tab_ml, tab_risk, tab_performance, tab_multi_asset, tab_custom_index = tabs
 
@@ -486,8 +459,8 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
     with col1:
         st.subheader("Account Summary")
         try:
-            profile = kite_client.profile() # Direct call
-            margins = kite_client.margins() # Direct call
+            profile = kite_client.profile() # Direct call, not cached
+            margins = kite_client.margins() # Direct call, not cached
             st.metric("Account Holder", profile.get("user_name", "N/A"))
             st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
             st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
@@ -543,60 +516,37 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
             st.info("Fetch some historical data in 'Market & Historical' tab to see quick performance here.")
 
 def render_portfolio_tab(kite_client: KiteConnect | None):
-    st.header("Your Portfolio Overview")
+    st.header("Portfolio (Future Enhancements)")
+    st.info("This tab is being re-designed to incorporate more advanced portfolio analytics, scenario modeling, and optimization features. For now, basic holdings and positions can be fetched via the sidebar.")
     if not kite_client:
-        st.info("Login first to fetch portfolio data.")
+        st.warning("Login to Kite Connect to enable future portfolio features.")
         return
-
-    col1, col2, col3 = st.columns(3)
+    
+    # Placeholder for future portfolio features (e.g., portfolio analytics, risk breakdown)
+    st.markdown("---")
+    st.subheader("Current Kite Portfolio Summary (Basic)")
+    col1, col2 = st.columns(2)
     with col1:
-        if st.button("Fetch Holdings", key="portfolio_fetch_holdings_btn"):
+        if st.button("Fetch Current Holdings", key="portfolio_fetch_holdings_tab_btn"):
             try:
-                holdings = kite_client.holdings() # Direct call
+                holdings = kite_client.holdings()
                 st.session_state["holdings_data"] = pd.DataFrame(holdings)
                 st.success(f"Fetched {len(holdings)} holdings.")
             except Exception as e:
                 st.error(f"Error fetching holdings: {e}")
         if not st.session_state.get("holdings_data", pd.DataFrame()).empty:
-            st.subheader("Current Holdings")
             st.dataframe(st.session_state["holdings_data"], use_container_width=True)
-        else:
-            st.info("No holdings data available. Click 'Fetch Holdings'.")
-
     with col2:
-        if st.button("Fetch Positions", key="portfolio_fetch_positions_btn"):
+        if st.button("Fetch Current Positions", key="portfolio_fetch_positions_tab_btn"):
             try:
-                positions = kite_client.positions() # Direct call
+                positions = kite_client.positions()
                 st.session_state["net_positions"] = pd.DataFrame(positions.get("net", []))
-                st.session_state["day_positions"] = pd.DataFrame(positions.get("day", []))
-                st.success(f"Fetched positions (Net: {len(positions.get('net', []))}, Day: {len(positions.get('day', []))}).")
+                st.success(f"Fetched {len(positions.get('net', []))} net positions.")
             except Exception as e:
                 st.error(f"Error fetching positions: {e}")
         if not st.session_state.get("net_positions", pd.DataFrame()).empty:
-            st.subheader("Net Positions")
             st.dataframe(st.session_state["net_positions"], use_container_width=True)
-        if not st.session_state.get("day_positions", pd.DataFrame()).empty:
-            st.subheader("Day Positions")
-            st.dataframe(st.session_state["day_positions"], use_container_width=True)
 
-    with col3:
-        if st.button("Fetch Margins", key="portfolio_fetch_margins_btn"):
-            try:
-                margins = kite_client.margins() # Direct call
-                st.session_state["margins_data"] = margins
-                st.success("Fetched margins data.")
-            except Exception as e:
-                st.error(f"Error fetching margins: {e}")
-        if st.session_state.get("margins_data"):
-            st.subheader("Available Margins")
-            margins_df = pd.DataFrame([
-                {"Category": "Equity - Available", "Value": st.session_state["margins_data"].get('equity', {}).get('available', {}).get('live_balance', 0)},
-                {"Category": "Equity - Used", "Value": st.session_state["margins_data"].get('equity', {}).get('utilised', {}).get('overall', 0)},
-                {"Category": "Commodity - Available", "Value": st.session_state["margins_data"].get('commodity', {}).get('available', {}).get('live_balance', 0)},
-                {"Category": "Commodity - Used", "Value": st.session_state["margins_data"].get('commodity', {}).get('utilised', {}).get('overall', 0)},
-            ])
-            margins_df["Value"] = margins_df["Value"].apply(lambda x: f"₹{x:,.2f}")
-            st.dataframe(margins_df, use_container_width=True)
 
 def render_orders_tab(kite_client: KiteConnect | None):
     st.header("Orders — Place, Modify, Cancel & View")
@@ -1002,5 +952,478 @@ def render_risk_stress_testing_tab(kite_client: KiteConnect | None):
             st.markdown(f"##### Results for Scenario: **{results['scenario_key']}**")
             st.metric("Current Price", f"₹{results['current_price']:.2f}")
             st.metric("Stressed Price", f"₹{results['stressed_price']:.2f}")
-            st.metric("Percentage Change", f"{results['scenario_change_percent']}")
+            st.metric("Percentage Change", f"{results['scenario_change_percent']:.2f}%")
 
+def render_performance_analysis_tab(kite_client: KiteConnect | None):
+    st.header("Performance Analysis")
+    if not kite_client:
+        st.info("Login first to analyze performance.")
+        return
+
+    historical_data = st.session_state.get("historical_data")
+    last_symbol = st.session_state.get("last_fetched_symbol", "N/A")
+
+    if historical_data.empty:
+        st.warning("No historical data. Fetch from 'Market & Historical' first.")
+        return
+    
+    historical_data['close'] = pd.to_numeric(historical_data['close'], errors='coerce')
+    returns_series = historical_data['close'].pct_change().dropna() * 100
+    if returns_series.empty or len(returns_series) < 2:
+        st.error("Not enough valid data for performance metrics.")
+        return
+
+    st.subheader(f"Performance Metrics for {last_symbol}")
+    col_metrics, col_chart = st.columns([1,2])
+    with col_metrics:
+        risk_free_rate = st.number_input("Risk-Free Rate (Annualized %)", 0.0, 10.0, 4.0, step=0.1, key="perf_risk_free_rate")
+        performance_metrics = calculate_performance_metrics(returns_series, risk_free_rate)
+        for k_m, v_m in performance_metrics.items(): st.metric(k_m, f"{v_m:.2f}%" if "%" in k_m else f"{v_m:.2f}")
+    
+    with col_chart:
+        fig_cum_returns = go.Figure()
+        cumulative_instrument_returns = (1 + returns_series / 100).cumprod() - 1
+        fig_cum_returns.add_trace(go.Scatter(x=cumulative_instrument_returns.index, y=cumulative_instrument_returns * 100, name=f'{last_symbol} Returns'))
+        
+        st.subheader("Benchmark Comparison (e.g., NIFTY 50)")
+        benchmark_symbol = st.text_input("Benchmark Symbol (e.g., NIFTY 50 from Zerodha)", "NIFTY 50", key="perf_benchmark_symbol")
+        if st.button("Fetch & Compare Benchmark", key="fetch_compare_benchmark_btn"):
+            with st.spinner(f"Fetching {benchmark_symbol} data..."):
+                try:
+                    # Fetch from Zerodha API via our cached function
+                    benchmark_data_df = get_historical_data_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], benchmark_symbol, historical_data.index.min().date(), historical_data.index.max().date(), "day", DEFAULT_EXCHANGE)
+                    
+                    if isinstance(benchmark_data_df, pd.DataFrame) and "_error" not in benchmark_data_df.columns and not benchmark_data_df.empty:
+                        benchmark_returns = benchmark_data_df['close'].pct_change().dropna() * 100
+                        # Align dates
+                        common_dates = returns_series.index.intersection(benchmark_returns.index)
+                        if not common_dates.empty and len(common_dates) > 1:
+                            returns_series_aligned = returns_series.loc[common_dates]
+                            benchmark_returns_aligned = benchmark_returns.loc[common_dates]
+                            cumulative_benchmark_returns = (1 + benchmark_returns_aligned / 100).cumprod() - 1
+                            fig_cum_returns.add_trace(go.Scatter(x=cumulative_benchmark_returns.index, y=cumulative_benchmark_returns * 100, name=f'{benchmark_symbol} Returns', line=dict(dash='dash')))
+                            
+                            df_for_alpha_beta = pd.DataFrame({'Asset': returns_series_aligned, 'Benchmark': benchmark_returns_aligned}).dropna()
+                            if len(df_for_alpha_beta) > 1:
+                                covariance = df_for_alpha_beta['Asset'].cov(df_for_alpha_beta['Benchmark'])
+                                benchmark_variance = df_for_alpha_beta['Benchmark'].var()
+                                beta = covariance / benchmark_variance if benchmark_variance != 0 else np.nan
+                                alpha_annual = (performance_metrics['Annualized Return (%)'] - risk_free_rate - beta * (calculate_performance_metrics(benchmark_returns_aligned)['Annualized Return (%)'] - risk_free_rate)) if not np.isnan(beta) else np.nan
+                                st.markdown("##### Alpha and Beta")
+                                st.metric("Beta", f"{beta:.2f}" if not np.isnan(beta) else "N/A")
+                                st.metric("Alpha (Annualized %)", f"{alpha_annual:.2f}%" if not np.isnan(alpha_annual) else "N/A")
+                            else: st.warning("Not enough common data for Alpha/Beta.")
+                        else: st.warning("No common historical data points with benchmark.")
+                    else: st.warning(f"Could not fetch benchmark data for {benchmark_symbol}: {benchmark_data_df.get('_error', 'Unknown error')}")
+                except Exception as e: st.error(f"Error fetching benchmark data: {e}")
+        fig_cum_returns.update_layout(title_text=f"Cumulative Returns: {last_symbol} vs. Benchmark", height=500)
+        st.plotly_chart(fig_cum_returns, use_container_width=True)
+
+def render_multi_asset_analysis_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("Multi-Asset Analysis: Correlation & Diversification")
+    if not kite_client:
+        st.info("Login first to perform multi-asset analysis.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for cached data access.")
+        return
+
+    st.subheader("Select Instruments for Analysis")
+    selected_symbols_str = st.text_area("Enter Trading Symbols (comma-separated, e.g., INFY,RELIANCE)", "INFY,RELIANCE", height=80, key="multi_asset_symbols_input")
+    symbols_to_analyze = [s.strip().upper() for s in selected_symbols_str.split(',') if s.strip()]
+    
+    multi_asset_exchange = st.selectbox("Exchange for all symbols", ["NSE", "BSE", "NFO"], key="multi_asset_exchange_selector")
+    multi_asset_interval = st.selectbox("Interval for historical data", ["day", "week", "month"], key="multi_asset_interval_selector")
+    from_date_multi = st.date_input("From Date", value=datetime.now().date() - timedelta(days=365), key="from_dt_multi_input")
+    to_date_multi = st.date_input("To Date", value=datetime.now().date(), key="to_dt_multi_input")
+
+    if st.button("Fetch Multi-Asset Data & Analyze", key="fetch_multi_asset_btn"):
+        # Load instruments once for all lookups in this tab
+        df_instruments_load = load_instruments_cached(api_key, access_token, multi_asset_exchange)
+        if "_error" in df_instruments_load.columns:
+            st.error(f"Failed to load instruments for lookup: {df_instruments_load.get('_error', 'Unknown error')}")
+            return
+        st.session_state["instruments_df"] = df_instruments_load
+
+
+        all_historical_data = {}
+        progress_bar = st.progress(0)
+        for i, symbol in enumerate(symbols_to_analyze):
+            with st.spinner(f"Fetching historical data for {symbol}..."):
+                df = get_historical_data_cached(api_key, access_token, symbol, from_date_multi, to_date_multi, multi_asset_interval, multi_asset_exchange)
+                if not df.empty and "_error" not in df.columns:
+                    all_historical_data[symbol] = df['close']
+                else:
+                    st.warning(f"No historical data for {symbol} or error: {df.get('_error', 'Unknown error')}. Skipping.")
+            progress_bar.progress((i + 1) / len(symbols_to_analyze))
+        
+        if len(all_historical_data) < 2:
+            st.error("Select at least two instruments with data for correlation analysis.")
+            return
+
+        combined_df = pd.DataFrame(all_historical_data)
+        combined_df.dropna(inplace=True)
+
+        if combined_df.empty or len(combined_df) < 2:
+            st.error("No common historical data. Adjust date range or symbols.")
+            return
+
+        returns_df = combined_df.pct_change().dropna()
+        st.session_state["multi_asset_returns"] = returns_df
+        st.session_state["multi_asset_correlation"] = returns_df.corr()
+        st.success("Multi-asset data fetched and correlations calculated.")
+        st.dataframe(combined_df.head(), use_container_width=True)
+
+    if st.session_state.get("multi_asset_correlation") is not None:
+        st.subheader("Correlation Matrix (Daily Returns)")
+        correlation_matrix = st.session_state["multi_asset_correlation"]
+        st.dataframe(correlation_matrix.style.background_gradient(cmap='RdBu', axis=None).format(precision=2), use_container_width=True)
+        fig_corr_heatmap = go.Figure(data=go.Heatmap(z=correlation_matrix.values, x=correlation_matrix.columns, y=correlation_matrix.index, colorscale='RdBu', zmin=-1, zmax=1))
+        fig_corr_heatmap.update_layout(title_text='Correlation Heatmap', height=600)
+        st.plotly_chart(fig_corr_heatmap, use_container_width=True)
+
+def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
+    st.header("📊 Custom Index Creation, Benchmarking & Export")
+    
+    if not kite_client:
+        st.info("Login to Kite first to fetch live and historical prices for index constituents.")
+        return
+    if not st.session_state["user_id"]:
+        st.info("Login with your Supabase account in the sidebar to save and load custom indexes.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for data access.")
+        return
+
+    # Helper function to render an index's details, charts, and export options
+    def display_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None):
+        st.markdown(f"### Details for Index: **{index_name}**")
+        
+        st.subheader("Constituents and Current Live Value")
+        
+        # Recalculate live value (might be slightly different from saved if saved with old prices)
+        live_quotes = {}
+        # Fetch all LTPs in one go if possible, then map
+        symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
+        if symbols_for_ltp:
+            try:
+                # Get the raw KiteConnect client to call the ltp method
+                kc_client = get_authenticated_kite_client(api_key, access_token)
+                if kc_client:
+                    # Construct list of instrument identifiers for LTP batch call
+                    instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                    ltp_data_batch = kc_client.ltp(instrument_identifiers)
+                    
+                    for sym in symbols_for_ltp:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        if key in ltp_data_batch:
+                            live_quotes[sym] = ltp_data_batch[key].get("last_price", np.nan)
+                        else:
+                            live_quotes[sym] = np.nan # Not found in batch response
+                else:
+                    st.warning("Kite client not available for batch LTP fetch.")
+            except Exception as e:
+                st.error(f"Error fetching batch LTP: {e}. Falling back to individual fetch (might be slower).")
+                # Fallback to individual fetch if batch fails
+                for sym in symbols_for_ltp:
+                    ltp_data = get_ltp_price_cached(api_key, access_token, sym, DEFAULT_EXCHANGE)
+                    live_quotes[sym] = ltp_data.get("last_price", np.nan) if ltp_data and "_error" not in ltp_data else np.nan
+        
+        # Ensure 'Name' column exists for display
+        if 'Name' not in constituents_df.columns:
+            # Try to populate 'Name' from instruments_df if available
+            if not st.session_state["instruments_df"].empty:
+                instrument_names = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
+                constituents_df['Name'] = constituents_df['symbol'].map(instrument_names).fillna(constituents_df['symbol'])
+            else:
+                constituents_df['Name'] = constituents_df['symbol'] # Fallback if no names found
+
+        constituents_df_display = constituents_df.copy()
+        constituents_df_display["Last Price"] = constituents_df_display["symbol"].map(live_quotes)
+        constituents_df_display["Weighted Price"] = constituents_df_display["Last Price"] * constituents_df_display["Weights"]
+        current_live_value = constituents_df_display["Weighted Price"].sum()
+
+        st.dataframe(constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].style.format({
+            "Weights": "{:.4f}",
+            "Last Price": "₹{:,.2f}",
+            "Weighted Price": "₹{:,.2f}"
+        }), use_container_width=True)
+        st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
+
+        st.markdown("---")
+        st.subheader("Index Composition")
+        fig_pie = go.Figure(data=[go.Pie(labels=constituents_df_display['Name'], values=constituents_df_display['Weights'], hole=.3)])
+        fig_pie.update_layout(title_text='Constituent Weights', height=400)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+
+        st.markdown("---")
+        st.subheader("Index Historical Performance and Benchmarking")
+
+        if index_history_df.empty or "_error" in index_history_df.columns:
+            st.warning(f"Historical performance data for '{index_name}' is not available or could not be calculated: {index_history_df.get('_error', ['Unknown Error'])[0]}")
+            return # Cannot proceed with charting if no historical data
+
+        fig_index_perf = go.Figure()
+        fig_index_perf.add_trace(go.Scatter(x=index_history_df.index, y=index_history_df['index_value'], mode='lines', name=f'Custom Index ({index_name})', line=dict(color='blue', width=2)))
+        
+        # Benchmarking
+        st.markdown("##### Add Benchmarks to Chart (from Zerodha API)")
+        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}")
+        benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
+        benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}")
+
+        if st.button("Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
+            # Load instruments for benchmark token lookup (once for this button click)
+            instruments_df_for_bench = load_instruments_cached(api_key, access_token, benchmark_exchange)
+            if "_error" in instruments_df_for_bench.columns:
+                st.error(f"Failed to load instruments for benchmark lookup: {instruments_df_for_bench.loc[0, '_error']}")
+                return
+
+            # Keep track of added benchmarks to avoid duplicates if button is pressed multiple times without rerun
+            if f"benchmarks_added_{index_id or index_name}" not in st.session_state:
+                st.session_state[f"benchmarks_added_{index_id or index_name}"] = []
+
+            for bench_symbol in benchmark_symbols:
+                if bench_symbol not in st.session_state[f"benchmarks_added_{index_id or index_name}"]:
+                    with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
+                        # Use get_historical_data_cached for benchmark data
+                        bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
+                    
+                    if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty:
+                        # Align dates and normalize benchmark
+                        if 'close' in bench_hist_df.columns:
+                            bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
+                            
+                            aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
+                            
+                            if not aligned_df.empty:
+                                benchmark_col_name = f'{bench_symbol}_close_bench'
+                                if benchmark_col_name in aligned_df.columns:
+                                    base_index_val = aligned_df['index_value'].iloc[0]
+                                    base_bench_val = aligned_df[benchmark_col_name].iloc[0]
+                                    if base_bench_val != 0:
+                                        aligned_df[f'{bench_symbol}_normalized'] = (aligned_df[benchmark_col_name] / base_bench_val) * base_index_val
+                                        fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
+                                        st.session_state[f"benchmarks_added_{index_id or index_name}"].append(bench_symbol)
+                                    else:
+                                        st.warning(f"First historical value of {bench_symbol} is zero, cannot normalize. Skipping benchmark.")
+                                else:
+                                    st.warning(f"Benchmark '{bench_symbol}' data missing expected column '{benchmark_col_name}' after merge. This can happen if merge failed or data is insufficient. Skipping benchmark.")
+                            else:
+                                st.warning(f"No common historical data between custom index and benchmark {bench_symbol}. Skipping benchmark.")
+                        else:
+                            st.warning(f"Benchmark '{bench_symbol}' historical data does not contain 'close' column. Skipping benchmark.")
+                    else:
+                        error_msg = bench_hist_df.get('_error', ['Unknown error'])[0] if isinstance(bench_hist_df, pd.DataFrame) else 'Unknown error'
+                        st.warning(f"No historical data obtained for benchmark {bench_symbol}. Skipping. Error: {error_msg}")
+        
+        # Always plot the current benchmarks stored in session state when this part of the tab re-renders
+        # This ensures they persist across reruns without re-fetching all if not necessary
+        if f"benchmarks_added_{index_id or index_name}" in st.session_state:
+            for bench_symbol in st.session_state[f"benchmarks_added_{index_id or index_name}"]:
+                # Re-fetch or reuse cached data for plotting
+                bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
+                if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty and 'close' in bench_hist_df.columns:
+                    bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
+                    aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
+                    if not aligned_df.empty:
+                        benchmark_col_name = f'{bench_symbol}_close_bench'
+                        if benchmark_col_name in aligned_df.columns:
+                            base_index_val = aligned_df['index_value'].iloc[0]
+                            base_bench_val = aligned_df[benchmark_col_name].iloc[0]
+                            if base_bench_val != 0:
+                                aligned_df[f'{bench_symbol}_normalized'] = (aligned_df[benchmark_col_name] / base_bench_val) * base_index_val
+                                fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
+
+        fig_index_perf.update_layout(title_text=f"Historical Performance: {index_name} vs. Benchmarks",
+                                  xaxis_title="Date", yaxis_title="Index Value (Normalized to 100 on Start Date)",
+                                  height=500, template="plotly_white", hovermode="x unified")
+        st.plotly_chart(fig_index_perf, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Export Options")
+        col_export1, col_export2 = st.columns(2)
+        with col_export1:
+            csv_constituents = constituents_df[['symbol', 'Name', 'Weights']].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Export Constituents to CSV",
+                data=csv_constituents,
+                file_name=f"{index_name}_constituents.csv",
+                mime="text/csv",
+                key=f"export_constituents_{index_id or index_name}"
+            )
+        with col_export2:
+            csv_history = index_history_df.to_csv().encode('utf-8')
+            st.download_button(
+                label="Export Historical Performance to CSV",
+                data=csv_history,
+                file_name=f"{index_name}_historical_performance.csv",
+                mime="text/csv",
+                key=f"export_history_{index_id or index_name}"
+            )
+
+    # --- Index Creation ---
+    st.markdown("---")
+    st.subheader("1. Create New Index from CSV")
+    uploaded_file = st.file_uploader("Upload CSV with columns: `symbol`, `Name`, `Weights`", type=["csv"], key="index_upload_csv")
+    
+    if uploaded_file:
+        try:
+            df_constituents_new = pd.read_csv(uploaded_file)
+            required_cols = {"symbol", "Name", "Weights"}
+            if not required_cols.issubset(set(df_constituents_new.columns)):
+                st.error(f"CSV must contain columns: {required_cols}.")
+                return
+
+            df_constituents_new["Weights"] = pd.to_numeric(df_constituents_new["Weights"], errors='coerce')
+            df_constituents_new.dropna(subset=["Weights"], inplace=True)
+            
+            if df_constituents_new.empty:
+                st.error("No valid constituents found in the CSV after processing weights.")
+                return
+
+            if df_constituents_new["Weights"].sum() == 0:
+                st.error("Sum of weights cannot be zero after normalization. Please provide positive weights.")
+                return
+            df_constituents_new["Weights"] = df_constituents_new["Weights"] / df_constituents_new["Weights"].sum()
+            st.info(f"Loaded {len(df_constituents_new)} constituents. Normalized weights to sum to 1.")
+
+            st.subheader("Configure Historical Calculation for New Index")
+            hist_start_date = st.date_input("Historical Start Date (for new index)", value=datetime.now().date() - timedelta(days=365), key="new_index_hist_start_date")
+            hist_end_date = st.date_input("Historical End Date (for new index)", value=datetime.now().date(), key="new_index_hist_end_date")
+
+            if hist_start_date >= hist_end_date:
+                st.error("Historical start date must be before end date.")
+                return
+
+            with st.spinner("Calculating historical index values... This may take some time depending on constituents and date range."):
+                index_history_df_new = _calculate_historical_index_value(api_key, access_token, df_constituents_new, hist_start_date, hist_end_date, DEFAULT_EXCHANGE)
+            
+            if not index_history_df_new.empty and "_error" not in index_history_df_new.columns:
+                st.session_state["current_calculated_index_data"] = df_constituents_new
+                st.session_state["current_calculated_index_history"] = index_history_df_new
+                st.success("Historical index values calculated successfully.")
+
+                # Display details for the newly calculated index immediately
+                display_index_details("Newly Calculated Index", df_constituents_new, index_history_df_new)
+            else:
+                st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', 'Unknown error')}")
+                st.session_state["current_calculated_index_data"] = None
+                st.session_state["current_calculated_index_history"] = pd.DataFrame()
+
+
+            if st.session_state["current_calculated_index_data"] is not None and not st.session_state["current_calculated_index_history"].empty:
+                st.markdown("---")
+                st.subheader("Save Newly Created Index to Database")
+                index_name_to_save = st.text_input("Enter a name for this new index to save", key="new_index_save_name")
+                if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
+                    if index_name_to_save and st.session_state["user_id"]:
+                        try:
+                            index_data = {
+                                "user_id": st.session_state["user_id"],
+                                "index_name": index_name_to_save,
+                                "constituents": st.session_state["current_calculated_index_data"][['symbol', 'Name', 'Weights']].to_dict(orient='records'),
+                                "historical_performance": st.session_state["current_calculated_index_history"].reset_index().to_dict(orient='records') # Store history
+                            }
+                            response = supabase_client.table("custom_indexes").insert(index_data).execute()
+                            if response.data:
+                                st.success(f"Index '{index_name_to_save}' saved successfully to Supabase!")
+                                st.session_state["saved_indexes"] = [] # Clear to force reload
+                                st.session_state["current_calculated_index_data"] = None # Clear new index data after saving
+                                st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to save index: {response.data}")
+                        except Exception as e:
+                            st.error(f"Error saving new index: {e}")
+                    else:
+                        st.warning("Please enter an index name and ensure you are logged into Supabase.")
+
+        except pd.errors.EmptyDataError:
+            st.error("The uploaded CSV file is empty.")
+        except Exception as e:
+            st.error(f"Error processing file or calculating index: {e}.")
+    
+    st.markdown("---")
+    st.subheader("3. Load & Manage Saved Indexes")
+    if st.button("Load My Indexes from DB", key="load_my_indexes_db_btn"):
+        try:
+            response = supabase_client.table("custom_indexes").select("id, index_name, constituents, historical_performance").eq("user_id", st.session_state["user_id"]).execute()
+            if response.data:
+                st.session_state["saved_indexes"] = response.data
+                st.success(f"Loaded {len(response.data)} indexes.")
+            else:
+                st.session_state["saved_indexes"] = []
+                st.info("No saved indexes found for your account.")
+        except Exception as e: st.error(f"Error loading indexes: {e}")
+    
+    if st.session_state.get("saved_indexes"):
+        index_names_from_db = [idx['index_name'] for idx in st.session_state["saved_indexes"]]
+        selected_index_name_from_db = st.selectbox("Select a saved index to display:", ["--- Select ---"] + index_names_from_db, key="select_saved_index_from_db")
+
+        if selected_index_name_from_db != "--- Select ---":
+            selected_db_index_data = next((idx for idx in st.session_state["saved_indexes"] if idx['index_name'] == selected_index_name_from_db), None)
+            if selected_db_index_data:
+                loaded_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
+
+                loaded_historical_df = pd.DataFrame()
+                if loaded_historical_performance_raw:
+                    loaded_historical_df = pd.DataFrame(loaded_historical_performance_raw)
+                    loaded_historical_df['date'] = pd.to_datetime(loaded_historical_df['date'])
+                    loaded_historical_df.set_index('date', inplace=True)
+                    loaded_historical_df.sort_index(inplace=True)
+                
+                # If historical data isn't saved or is empty, re-calculate it live
+                if loaded_historical_df.empty or "_error" in loaded_historical_df.columns:
+                    st.warning(f"Historical data for '{selected_index_name_from_db}' was not found in DB or is invalid. Recalculating live...")
+                    # Determine date range for recalculation based on current defaults
+                    # Default to 1 year for recalculation if no historical data is saved.
+                    min_date = (datetime.now().date() - timedelta(days=365))
+                    max_date = datetime.now().date()
+                    
+                    with st.spinner("Recalculating historical index values (live)..."):
+                        recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
+                    
+                    if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
+                        loaded_historical_df = recalculated_historical_df
+                        st.success("Historical data recalculated live.")
+                    else:
+                        st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', 'Unknown error')}")
+                        loaded_historical_df = pd.DataFrame({"_error": ["Failed to recalculate historical data."]})
+
+
+                display_index_details(selected_index_name_from_db, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'])
+                
+                st.markdown("---")
+                if st.button(f"Delete Index '{selected_index_name_from_db}' from DB", key=f"delete_index_{selected_db_index_data['id']}"):
+                    try:
+                        response = supabase_client.table("custom_indexes").delete().eq("id", selected_db_index_data['id']).execute()
+                        if response.data:
+                            st.success(f"Index '{selected_index_name_from_db}' deleted successfully.")
+                            st.session_state["saved_indexes"] = []
+                            st.rerun()
+                        else: st.error(f"Failed to delete index: {response.data}")
+                    except Exception as e: st.error(f"Error deleting index: {e}")
+            else: st.error("Selected index data not found.")
+    else: st.info("No indexes loaded yet. Click 'Load My Indexes from DB'.")
+
+# Removed render_websocket_tab
+# Removed render_instruments_utils_tab
+
+
+# --- Main Application Logic (Tab Rendering) ---
+# Global api_key and access_token to pass to tab functions that use cached utility functions.
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+with tab_dashboard: render_dashboard_tab(k, api_key, access_token)
+with tab_portfolio: render_portfolio_tab(k)
+with tab_orders: render_orders_tab(k)
+with tab_market: render_market_historical_tab(k, api_key, access_token)
+with tab_ml: render_ml_analysis_tab(k, api_key, access_token)
+with tab_risk: render_risk_stress_testing_tab(k)
+with tab_performance: render_performance_analysis_tab(k)
+with tab_multi_asset: render_multi_asset_analysis_tab(k, api_key, access_token)
+with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
