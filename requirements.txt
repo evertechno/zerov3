@@ -1,3 +1,4 @@
 streamlit
-smartapi
+smartapi-python
 pyotp
+smartapi
