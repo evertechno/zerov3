@@ -1519,7 +1519,7 @@ def render_websocket_tab(kite_client: KiteConnect | None):
                     st.session_state["kt_status_message"] = "Ticker connected. Subscribing..."
                     if symbol_for_ws:
                         try:
-                            tokens = [int(x.strip()) for x x in symbol_for_ws.split(",") if x.strip()]
+                            tokens = [int(x.strip()) for x x in symbol_for_ws.split(",") if x.strip()],
                             if tokens:
                                 ws.subscribe(tokens)
                                 ws.set_mode(ws.MODE_FULL, tokens)
