@@ -1198,16 +1198,16 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         st.markdown("---")
         st.markdown("##### Benchmark Comparison and Advanced Metrics")
-        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}")
+        # Ensure we have a unique key for the text input and button for each instance of the index analysis
+        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}_input")
         benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
-        benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}")
+        benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}_select")
 
         # Store benchmark data to plot persistently until symbols change
         session_key = f"active_benchmarks_data_{index_id or index_name}"
         if session_key not in st.session_state:
             st.session_state[session_key] = {}
 
-        # Use two buttons: one to fetch (resets current bench state), one to trigger analysis (uses current state)
         if st.button("Fetch & Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
             # Clear previous benchmark data if new symbols are fetched
             st.session_state[session_key] = {}
@@ -1217,7 +1217,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 return
 
             for bench_symbol in benchmark_symbols:
-                # FIX 2: Ensure fetching uses the exact same period as the custom index
+                # Ensure fetching uses the exact same period as the custom index
                 start_date_hist = index_history_df.index.min().date()
                 end_date_hist = index_history_df.index.max().date()
                 
@@ -1379,11 +1379,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         if check_response.data:
                             st.warning(f"An index named '{index_name_to_save}' already exists. Please choose a different name.")
                         else:
-                            # --- FIX 1: JSON Serialization Error ---
+                            # --- FIX: JSON Serialization Error (using strftime for robustness) ---
                             history_df_to_save = st.session_state["current_calculated_index_history"].reset_index()
                             # Convert the Timestamp column ('date') to ISO 8601 string format
-                            history_df_to_save['date'] = history_df_to_save['date'].dt.isoformat()
-                            # -------------------------------------
+                            # Using strftime('%Y-%m-%dT%H:%M:%S') is safer than .dt.isoformat()
+                            history_df_to_save['date'] = history_df_to_save['date'].dt.strftime('%Y-%m-%dT%H:%M:%S') 
+                            # -------------------------------------------------------------------
 
                             index_data = {
                                 "user_id": st.session_state["user_id"],
@@ -1409,7 +1410,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     if st.button("Load My Indexes from DB", key="load_my_indexes_db_btn"):
         try:
             with st.spinner("Loading indexes..."):
-                # Supabase table structure supports saving many indexes per user (unlimited capacity)
+                # Database structure supports arbitrary number of indexes
                 response = supabase_client.table("custom_indexes").select("id, index_name, constituents, historical_performance").eq("user_id", st.session_state["user_id"]).execute()
             if response.data:
                 st.session_state["saved_indexes"] = response.data
@@ -1421,6 +1422,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     
     if st.session_state.get("saved_indexes"):
         index_names_from_db = [idx['index_name'] for idx in st.session_state["saved_indexes"]]
+        # The selectbox allows scrolling through unlimited saved indices
         selected_index_name_from_db = st.selectbox("Select a saved index to analyze:", ["--- Select ---"] + index_names_from_db, key="select_saved_index_from_db")
 
         if selected_index_name_from_db != "--- Select ---":
@@ -1446,6 +1448,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         loaded_historical_df = pd.DataFrame() # Clear invalid data
                 
                 if loaded_historical_df.empty:
+                    # Use a default period for recalculation if saved data is corrupt/missing
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
                     # Recalculate historical data if saved version is missing or invalid
