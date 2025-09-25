@@ -2,7 +2,7 @@ import streamlit as st
 from kiteconnect import KiteConnect
 import pandas as pd
 import json
-import threading # Kept for potential future async operations, though not directly used for websockets anymore
+import threading 
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -1002,7 +1002,7 @@ def render_performance_analysis_tab(kite_client: KiteConnect | None):
                     # Fetch from Zerodha API via our cached function
                     benchmark_data_df = get_historical_data_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], benchmark_symbol, historical_data.index.min().date(), historical_data.index.max().date(), "day", DEFAULT_EXCHANGE)
                     
-                    if isinstance(benchmark_data_df, pd.DataFrame) and "_error" not in benchmark_data_df.columns and not benchmark_data_df.empty:
+                    if isinstance(benchmark_data_df, pd.DataFrame) and "_error" not in benchmark_data_df.columns and not benchmark_data_df.empty and 'close' in benchmark_data_df.columns:
                         benchmark_returns = benchmark_data_df['close'].pct_change().dropna() * 100
                         # Align dates
                         common_dates = returns_series.index.intersection(benchmark_returns.index)
@@ -1127,6 +1127,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     kc_client = get_authenticated_kite_client(api_key, access_token)
                     if kc_client:
                         instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                        # Use uncached LTP batch call for the live price check
                         ltp_data_batch = kc_client.ltp(instrument_identifiers)
                         
                         for sym in symbols_for_ltp:
@@ -1206,8 +1207,9 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if session_key not in st.session_state:
             st.session_state[session_key] = {}
 
-        if st.button("Analyze & Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
-            # Clear previous benchmark data if new symbols are entered
+        # Use two buttons: one to fetch (resets current bench state), one to trigger analysis (uses current state)
+        if st.button("Fetch & Add Benchmarks to Chart", key=f"add_benchmarks_{index_id or index_name}"):
+            # Clear previous benchmark data if new symbols are fetched
             st.session_state[session_key] = {}
 
             if "_error" in st.session_state["instruments_df"].columns:
@@ -1215,8 +1217,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 return
 
             for bench_symbol in benchmark_symbols:
-                with st.spinner(f"Fetching historical data for benchmark {bench_symbol}..."):
-                    bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, index_history_df.index.min().date(), index_history_df.index.max().date(), "day", benchmark_exchange)
+                # FIX 2: Ensure fetching uses the exact same period as the custom index
+                start_date_hist = index_history_df.index.min().date()
+                end_date_hist = index_history_df.index.max().date()
+                
+                with st.spinner(f"Fetching historical data for benchmark {bench_symbol} from {start_date_hist} to {end_date_hist}..."):
+                    bench_hist_df = get_historical_data_cached(api_key, access_token, bench_symbol, start_date_hist, end_date_hist, "day", benchmark_exchange)
                 
                 if isinstance(bench_hist_df, pd.DataFrame) and "_error" not in bench_hist_df.columns and not bench_hist_df.empty and 'close' in bench_hist_df.columns:
                     st.session_state[session_key][bench_symbol] = bench_hist_df
@@ -1228,6 +1234,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         for bench_symbol, bench_hist_df in st.session_state[session_key].items():
             bench_hist_df_renamed = bench_hist_df[['close']].rename(columns={'close': f'{bench_symbol}_close_bench'})
             
+            # Align data using inner join to ensure comparison period is based on mutual availability
             aligned_df = pd.merge(index_history_df[['index_value']], bench_hist_df_renamed, left_index=True, right_index=True, how='inner')
             
             if not aligned_df.empty:
@@ -1238,6 +1245,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     base_bench_val = aligned_df.loc[first_common_date, benchmark_col_name]
 
                     if base_bench_val != 0:
+                        # Normalize the benchmark price series to match the custom index's base value on the first common date
                         aligned_df[f'{bench_symbol}_normalized'] = (aligned_df[benchmark_col_name] / base_bench_val) * base_index_val
                         fig_index_perf.add_trace(go.Scatter(x=aligned_df.index, y=aligned_df[f'{bench_symbol}_normalized'], mode='lines', name=f'Benchmark: {bench_symbol}', line=dict(dash='dash')))
                         
@@ -1362,7 +1370,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         st.markdown("---")
         st.subheader("Save Newly Created Index")
-        index_name_to_save = st.text_input("Enter a unique name for this index to save it:", key="new_index_save_name")
+        index_name_to_save = st.text_input("Enter a unique name for this index to save it:", value="policapex", key="new_index_save_name")
         if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
             if index_name_to_save and st.session_state["user_id"]:
                 try:
@@ -1371,11 +1379,17 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         if check_response.data:
                             st.warning(f"An index named '{index_name_to_save}' already exists. Please choose a different name.")
                         else:
+                            # --- FIX 1: JSON Serialization Error ---
+                            history_df_to_save = st.session_state["current_calculated_index_history"].reset_index()
+                            # Convert the Timestamp column ('date') to ISO 8601 string format
+                            history_df_to_save['date'] = history_df_to_save['date'].dt.isoformat()
+                            # -------------------------------------
+
                             index_data = {
                                 "user_id": st.session_state["user_id"],
                                 "index_name": index_name_to_save,
                                 "constituents": st.session_state["current_calculated_index_data"][['symbol', 'Name', 'Weights']].to_dict(orient='records'),
-                                "historical_performance": st.session_state["current_calculated_index_history"].reset_index().to_dict(orient='records')
+                                "historical_performance": history_df_to_save.to_dict(orient='records')
                             }
                             response = supabase_client.table("custom_indexes").insert(index_data).execute()
                             st.success(f"Index '{index_name_to_save}' saved successfully!")
@@ -1385,6 +1399,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             st.session_state["current_calculated_index_history"] = pd.DataFrame()
                             st.rerun()
                 except Exception as e:
+                    # Capture the error message if something else goes wrong during save
                     st.error(f"Error saving new index: {e}")
             else:
                 st.warning("Please enter an index name and ensure you are logged into Supabase.")
@@ -1394,6 +1409,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     if st.button("Load My Indexes from DB", key="load_my_indexes_db_btn"):
         try:
             with st.spinner("Loading indexes..."):
+                # Supabase table structure supports saving many indexes per user (unlimited capacity)
                 response = supabase_client.table("custom_indexes").select("id, index_name, constituents, historical_performance").eq("user_id", st.session_state["user_id"]).execute()
             if response.data:
                 st.session_state["saved_indexes"] = response.data
@@ -1419,18 +1435,20 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if loaded_historical_performance_raw:
                     try:
                         loaded_historical_df = pd.DataFrame(loaded_historical_performance_raw)
+                        # Re-parse ISO string back to Timestamp
                         loaded_historical_df['date'] = pd.to_datetime(loaded_historical_df['date'])
                         loaded_historical_df.set_index('date', inplace=True)
                         loaded_historical_df.sort_index(inplace=True)
                         if loaded_historical_df.empty or 'index_value' not in loaded_historical_df.columns:
                             raise ValueError("Loaded historical data is invalid.")
                     except Exception:
-                        st.warning(f"Saved historical data for '{selected_index_name_from_db}' is invalid. Recalculating live...")
+                        st.warning(f"Saved historical data for '{selected_index_name_from_db}' is invalid or outdated. Recalculating live...")
                         loaded_historical_df = pd.DataFrame() # Clear invalid data
                 
                 if loaded_historical_df.empty:
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
+                    # Recalculate historical data if saved version is missing or invalid
                     recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
                     
                     if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
