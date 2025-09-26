@@ -1370,7 +1370,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         st.markdown("---")
         st.subheader("Save Newly Created Index")
-        index_name_to_save = st.text_input("Enter a unique name for this index to save it:", value="policapex", key="new_index_save_name")
+        index_name_to_save = st.text_input("Enter a unique name for this index to save it:", value="MyCustomIndex", key="new_index_save_name")
         if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
             if index_name_to_save and st.session_state["user_id"]:
                 try:
