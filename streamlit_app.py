@@ -1198,8 +1198,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         st.markdown("---")
         st.markdown("##### Benchmark Comparison and Advanced Metrics")
-        # Ensure we have a unique key for the text input and button for each instance of the index analysis
-        benchmark_symbols_str = st.text_input("Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY)", value="NIFTY 50", key=f"benchmark_symbols_{index_id or index_name}_input")
+        # --- FIX: Changed to st.text_area for explicit multiple benchmark input ---
+        benchmark_symbols_str = st.text_area(
+            "Enter Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY,NIFTY BANK)",
+            value="NIFTY 50,BANKNIFTY", # Changed default to show multiple
+            height=80, # Make it a text area for better multi-line input
+            key=f"benchmark_symbols_{index_id or index_name}_input"
+        )
+        # --- END FIX ---
         benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
         benchmark_exchange = st.selectbox("Benchmark Exchange", ["NSE", "BSE", "NFO"], key=f"bench_exchange_{index_id or index_name}_select")
 
