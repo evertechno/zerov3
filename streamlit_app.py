@@ -1111,29 +1111,32 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     def _fetch_and_normalize_data_for_comparison(
         name: str,
         data_type: str, # "custom_index" or "benchmark"
+        comparison_start_date: datetime.date, # User-defined start date for comparison
+        comparison_end_date: datetime.date,   # User-defined end date for comparison
         constituents_df: pd.DataFrame = None, # For custom index
         symbol: str = None, # For benchmark
-        start_date: datetime.date = None,
-        end_date: datetime.date = None,
         exchange: str = DEFAULT_EXCHANGE,
         api_key: str = None,
         access_token: str = None
     ) -> pd.DataFrame:
         """
-        Fetches and normalizes historical data for a custom index or a benchmark symbol.
+        Fetches and normalizes historical data for a custom index or a benchmark symbol
+        within a specified comparison date range.
         Returns a DataFrame with 'date' and 'normalized_value'.
         """
+        hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
                 return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
-            hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, start_date, end_date, exchange)
+            # Always recalculate for the exact comparison range to ensure consistency
+            hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
                 return hist_df
             data_series = hist_df['index_value']
         elif data_type == "benchmark":
             if symbol is None:
                 return pd.DataFrame({"_error": [f"No symbol for benchmark {name}."]})
-            hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
+            hist_df = get_historical_data_cached(api_key, access_token, symbol, comparison_start_date, comparison_end_date, "day", exchange)
             if "_error" in hist_df.columns:
                 return hist_df
             data_series = hist_df['close']
@@ -1141,14 +1144,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             return pd.DataFrame({"_error": ["Invalid data_type for comparison."]})
 
         if data_series.empty:
-            return pd.DataFrame({"_error": [f"No historical data for {name}."]})
+            return pd.DataFrame({"_error": [f"No historical data for {name} within the selected range."]})
 
-        # Normalize to 100 on the first available date
+        # Normalize to 100 on the first available date within the fetched series
         first_valid_index = data_series.first_valid_index()
         if first_valid_index is not None and data_series[first_valid_index] != 0:
             normalized_series = (data_series / data_series[first_valid_index]) * 100
-            return pd.DataFrame({'normalized_value': normalized_series}).rename_axis('date')
-        return pd.DataFrame({"_error": [f"Could not normalize {name} (first value is zero or no valid data)."]})
+            return pd.DataFrame({'normalized_value': normalized_series, 'raw_values': data_series}).rename_axis('date')
+        return pd.DataFrame({"_error": [f"Could not normalize {name} (first value is zero or no valid data in range)."]})
 
 
     # Helper function to render an index's details, charts, and export options
@@ -1313,7 +1316,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                                 "user_id": st.session_state["user_id"],
                                 "index_name": index_name_to_save,
                                 "constituents": st.session_state["current_calculated_index_data"][['symbol', 'Name', 'Weights']].to_dict(orient='records'),
-                                "historical_performance": history_df_to_save.to_dict(orient='records')
+                                "historical_performance": history_df_to_to_save.to_dict(orient='records')
                             }
                             response = supabase_client.table("custom_indexes").insert(index_data).execute()
                             st.success(f"Index '{index_name_to_save}' saved successfully!")
@@ -1344,39 +1347,37 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     if st.session_state.get("saved_indexes"):
         index_names_from_db = [idx['index_name'] for idx in st.session_state["saved_indexes"]]
         
-        # --- NEW: Allow selection of multiple custom indexes ---
         selected_custom_indexes_names = st.multiselect(
-            "Select saved custom indexes to analyze:", 
+            "Select saved custom indexes to include in comparison:", 
             options=index_names_from_db, 
             key="select_saved_indexes_for_comparison"
         )
-        # --- END NEW ---
 
-        # --- NEW: Input for multiple external benchmarks ---
         st.markdown("---")
-        st.subheader("3. Compare Selected Custom Indexes and External Benchmarks")
-        benchmark_symbols_str = st.text_area(
-            "Enter External Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY,NIFTY BANK)",
-            value="NIFTY 50", # Default to one benchmark
-            height=80,
-            key="comparison_benchmark_symbols_input"
-        )
-        external_benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
-        comparison_exchange = st.selectbox("Exchange for External Benchmarks", ["NSE", "BSE", "NFO"], key="comparison_bench_exchange_select")
+        st.subheader("3. Configure & Run Multi-Index & Benchmark Comparison")
         
-        # Determine the overall date range for fetching data
-        # This will be the union of all selected custom indexes' historical data ranges
-        # and the user-defined range for new custom index calculation.
-        # For simplicity, let's use a fixed range for the comparison chart for now,
-        # or the widest range available from selected custom indexes.
-        
-        # For now, let's use a fixed range for the comparison chart, or the widest range available
-        # from selected custom indexes if any are chosen.
-        min_date_overall = datetime.now().date() - timedelta(days=365)
-        max_date_overall = datetime.now().date()
+        col_comp_dates, col_comp_bench = st.columns(2)
+        with col_comp_dates:
+            comparison_start_date = st.date_input("Comparison Start Date", value=datetime.now().date() - timedelta(days=365), key="comparison_start_date")
+            comparison_end_date = st.date_input("Comparison End Date", value=datetime.now().date(), key="comparison_end_date")
+            if comparison_start_date >= comparison_end_date:
+                st.error("Comparison start date must be before end date.")
+                return # Stop execution if dates are invalid
 
-        if selected_custom_indexes_names or external_benchmark_symbols:
-            if st.button("Run Multi-Index & Benchmark Comparison", key="run_multi_comparison_btn"):
+        with col_comp_bench:
+            benchmark_symbols_str = st.text_area(
+                "Enter External Benchmark Symbols (comma-separated, e.g., NIFTY 50,BANKNIFTY,NIFTY BANK)",
+                value="NIFTY 50", # Default to one benchmark
+                height=80,
+                key="comparison_benchmark_symbols_input"
+            )
+            external_benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
+            comparison_exchange = st.selectbox("Exchange for External Benchmarks", ["NSE", "BSE", "NFO"], key="comparison_bench_exchange_select")
+        
+        if st.button("Run Multi-Index & Benchmark Comparison", key="run_multi_comparison_btn"):
+            if not selected_custom_indexes_names and not external_benchmark_symbols:
+                st.warning("Please select at least one custom index or enter at least one benchmark symbol for comparison.")
+            else:
                 all_normalized_data = {}
                 all_performance_metrics = {}
                 
@@ -1395,90 +1396,92 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     if db_index_data:
                         constituents_df = pd.DataFrame(db_index_data['constituents'])
                         
-                        # Try to use saved historical data first
-                        loaded_historical_df = pd.DataFrame()
-                        if db_index_data.get('historical_performance'):
-                            try:
-                                loaded_historical_df = pd.DataFrame(db_index_data['historical_performance'])
-                                loaded_historical_df['date'] = pd.to_datetime(loaded_historical_df['date'])
-                                loaded_historical_df.set_index('date', inplace=True)
-                                loaded_historical_df.sort_index(inplace=True)
-                                if loaded_historical_df.empty or 'index_value' not in loaded_historical_df.columns:
-                                    raise ValueError("Invalid saved historical data.")
-                            except Exception:
-                                loaded_historical_df = pd.DataFrame() # Clear invalid data
-
-                        if loaded_historical_df.empty:
-                            st.warning(f"Recalculating historical data for custom index '{index_name}' as saved data is invalid or missing.")
-                            loaded_historical_df = _calculate_historical_index_value(api_key, access_token, constituents_df, min_date_overall, max_date_overall, DEFAULT_EXCHANGE)
-                        
-                        if not loaded_historical_df.empty and "_error" not in loaded_historical_df.columns:
-                            normalized_df = _fetch_and_normalize_data_for_comparison(
-                                name=index_name,
-                                data_type="custom_index",
-                                constituents_df=constituents_df,
-                                start_date=loaded_historical_df.index.min().date(),
-                                end_date=loaded_historical_df.index.max().date(),
-                                api_key=api_key,
-                                access_token=access_token
-                            )
-                            if "_error" not in normalized_df.columns:
-                                all_normalized_data[index_name] = normalized_df['normalized_value']
-                                all_performance_metrics[index_name] = calculate_performance_metrics(loaded_historical_df['index_value'].pct_change().dropna() * 100)
-                            else:
-                                st.error(f"Error normalizing custom index {index_name}: {normalized_df.loc[0, '_error']}")
+                        normalized_df_result = _fetch_and_normalize_data_for_comparison(
+                            name=index_name,
+                            data_type="custom_index",
+                            comparison_start_date=comparison_start_date,
+                            comparison_end_date=comparison_end_date,
+                            constituents_df=constituents_df,
+                            api_key=api_key,
+                            access_token=access_token
+                        )
+                        if "_error" not in normalized_df_result.columns:
+                            all_normalized_data[index_name] = normalized_df_result['normalized_value']
+                            # Use raw values for performance metrics calculation
+                            all_performance_metrics[index_name] = calculate_performance_metrics(normalized_df_result['raw_values'].pct_change().dropna() * 100)
                         else:
-                            st.error(f"Failed to get historical data for custom index {index_name}: {loaded_historical_df.get('_error', ['Unknown error'])[0]}")
+                            st.error(f"Error processing custom index {index_name}: {normalized_df_result.loc[0, '_error']}")
 
                 # Fetch data for external benchmarks
                 for symbol in external_benchmark_symbols:
-                    normalized_df = _fetch_and_normalize_data_for_comparison(
+                    normalized_df_result = _fetch_and_normalize_data_for_comparison(
                         name=symbol,
                         data_type="benchmark",
+                        comparison_start_date=comparison_start_date,
+                        comparison_end_date=comparison_end_date,
                         symbol=symbol,
-                        start_date=min_date_overall,
-                        end_date=max_date_overall,
                         exchange=comparison_exchange,
                         api_key=api_key,
                         access_token=access_token
                     )
-                    if "_error" not in normalized_df.columns:
-                        all_normalized_data[symbol] = normalized_df['normalized_value']
-                        # Fetch raw data for performance metrics
-                        raw_bench_df = get_historical_data_cached(api_key, access_token, symbol, min_date_overall, max_date_overall, "day", comparison_exchange)
-                        if not raw_bench_df.empty and 'close' in raw_bench_df.columns:
-                            all_performance_metrics[symbol] = calculate_performance_metrics(raw_bench_df['close'].pct_change().dropna() * 100)
-                        else:
-                            st.warning(f"Could not calculate performance metrics for benchmark {symbol}.")
+                    if "_error" not in normalized_df_result.columns:
+                        all_normalized_data[symbol] = normalized_df_result['normalized_value']
+                        # Use raw values for performance metrics calculation
+                        all_performance_metrics[symbol] = calculate_performance_metrics(normalized_df_result['raw_values'].pct_change().dropna() * 100)
                     else:
-                        st.error(f"Error normalizing benchmark {symbol}: {normalized_df.loc[0, '_error']}")
+                        st.error(f"Error processing benchmark {symbol}: {normalized_df_result.loc[0, '_error']}")
 
                 if all_normalized_data:
+                    # Combine all normalized series into a single DataFrame
                     combined_comparison_df = pd.DataFrame(all_normalized_data)
-                    combined_comparison_df.dropna(how='all', inplace=True) # Drop dates where all are NaN
+                    
+                    # Ensure all series start from the same point for visual comparison
+                    # Find the first date where ALL selected series have data
+                    first_common_valid_date = combined_comparison_df.dropna().index.min()
 
-                    if not combined_comparison_df.empty:
-                        st.markdown("#### Cumulative Performance Comparison (Normalized to 100)")
-                        fig_comparison = go.Figure()
+                    if first_common_valid_date:
+                        # Re-normalize all series based on their value at the first_common_valid_date
+                        # This ensures they all start at 100 on the first date they all have data
                         for col in combined_comparison_df.columns:
-                            fig_comparison.add_trace(go.Scatter(x=combined_comparison_df.index, y=combined_comparison_df[col], mode='lines', name=col))
+                            if col in combined_comparison_df.columns and first_common_valid_date in combined_comparison_df.index:
+                                base_value = combined_comparison_df.loc[first_common_valid_date, col]
+                                if base_value != 0 and not pd.isna(base_value):
+                                    combined_comparison_df[col] = (combined_comparison_df[col] / base_value) * 100
+                                else:
+                                    st.warning(f"Could not re-normalize {col} at common start date. Skipping from chart.")
+                                    combined_comparison_df.drop(columns=[col], inplace=True)
+                            else:
+                                st.warning(f"Data for {col} not available at common start date. Skipping from chart.")
+                                combined_comparison_df.drop(columns=[col], inplace=True)
                         
-                        fig_comparison.update_layout(
-                            title_text="Multi-Index & Benchmark Performance",
-                            xaxis_title="Date",
-                            yaxis_title="Normalized Value (Base 100)",
-                            height=600,
-                            template="plotly_white",
-                            hovermode="x unified"
-                        )
-                        st.plotly_chart(fig_comparison, use_container_width=True)
+                        # Drop rows before the first common valid date
+                        combined_comparison_df = combined_comparison_df.loc[first_common_valid_date:]
+                        combined_comparison_df.dropna(how='all', inplace=True) # Drop any rows that became all NaN after re-normalization
 
-                        st.markdown("#### Performance Metrics Summary")
-                        metrics_df = pd.DataFrame(all_performance_metrics).T
-                        st.dataframe(metrics_df.style.format("{:.2f}"), use_container_width=True)
+                        if not combined_comparison_df.empty:
+                            st.markdown("#### Cumulative Performance Comparison (Normalized to 100)")
+                            fig_comparison = go.Figure()
+                            for col in combined_comparison_df.columns:
+                                fig_comparison.add_trace(go.Scatter(x=combined_comparison_df.index, y=combined_comparison_df[col], mode='lines', name=col))
+                            
+                            fig_comparison.update_layout(
+                                title_text="Multi-Index & Benchmark Performance",
+                                xaxis_title="Date",
+                                yaxis_title="Normalized Value (Base 100)",
+                                height=600,
+                                template="plotly_white",
+                                hovermode="x unified"
+                            )
+                            st.plotly_chart(fig_comparison, use_container_width=True)
 
+                            st.markdown("#### Performance Metrics Summary")
+                            metrics_df = pd.DataFrame(all_performance_metrics).T
+                            st.dataframe(metrics_df.style.format("{:.2f}"), use_container_width=True)
+
+                        else:
+                            st.warning("No common historical data available for comparison after fetching and normalization. Adjust date range or selections.")
                     else:
-                        st.warning("No common historical data available for comparison after fetching and normalization. Adjust date range or selections.")
+                        st.warning("No common starting date found for all selected assets within the chosen comparison period. Please check data availability or adjust dates.")
                 else:
                     st.info("No data selected or fetched for comparison.")
         # --- END NEW ---
