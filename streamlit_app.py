@@ -45,6 +45,14 @@ if "user_session" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
 
+# --- ML specific initializations (Fix for KeyError) ---
+if "ml_data" not in st.session_state:
+    st.session_state["ml_data"] = pd.DataFrame()
+if "ml_model" not in st.session_state:
+    st.session_state["ml_model"] = None
+if "prediction_horizon" not in st.session_state:
+    st.session_state["prediction_horizon"] = 5 # Default value
+
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
     secrets = st.secrets
@@ -369,8 +377,10 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
     ml_data = st.session_state.get("ml_data", pd.DataFrame())
     
     if not ml_data.empty:
+        
+        # Capture the current widget value for horizon
         with col_prep:
-            prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=20, value=5, step=1, key="pred_horizon")
+            current_prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=20, value=5, step=1, key="pred_horizon")
             test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
         
         st.markdown("---")
@@ -380,7 +390,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
         
         # --- Data Prep ---
         ml_data_processed = ml_data.copy()
-        ml_data_processed['target'] = ml_data_processed['close'].shift(-prediction_horizon)
+        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
         ml_data_processed.dropna(subset=['target'], inplace=True)
         
         # Features exclude price columns, target, and volume (unless normalized)
@@ -422,7 +432,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 }.get(model_type_selected)
 
                 if model:
-                    with st.spinner(f"Training {model_type_selected} model for {prediction_horizon}-day prediction..."):
+                    with st.spinner(f"Training {model_type_selected} model for {current_prediction_horizon}-day prediction..."):
                         model.fit(X_train, y_train)
                         y_pred = model.predict(X_test)
                     
@@ -433,11 +443,12 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                     st.session_state["scaler"] = scaler
                     st.session_state["ml_features"] = selected_features
                     st.session_state["ml_model_type"] = model_type_selected
-                    st.session_state["prediction_horizon"] = prediction_horizon
-                    st.success(f"{model_type_selected} Model Trained for {prediction_horizon}-day horizon!")
+                    st.session_state["prediction_horizon"] = current_prediction_horizon # Save the actual horizon used
+                    st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon}-day horizon!")
         
         with col_ml_output:
             if st.session_state.get("ml_model") and st.session_state.get("y_test") is not None:
+                # This access is now safe due to global initialization and setting in the training block
                 mse = mean_squared_error(st.session_state['y_test'], st.session_state['y_pred'])
                 rmse = np.sqrt(mse)
                 r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
@@ -465,7 +476,6 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             horizon = st.session_state["prediction_horizon"]
             
             # Prepare the latest data point for prediction
-            # Use the absolute latest row from the ML data (which has all indicators calculated)
             latest_row = ml_data[features_list].iloc[[-1]] 
             
             # Scale the features
