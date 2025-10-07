@@ -15,7 +15,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
 from sklearn.preprocessing import MinMaxScaler 
-import time # Used for timing the backtest
+import time 
 
 # Supabase imports (Keeping them for completeness, though auth is simplified)
 from supabase import create_client, Client
@@ -208,42 +208,55 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     return df_copy
 
 def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.02) -> dict: # 2% RF rate default
-    """Calculates comprehensive performance metrics for a series of returns."""
+    """
+    Calculates comprehensive performance metrics for a series of returns.
+    FIXED: Caps loss at 100% and reports Max Drawdown as a positive value.
+    """
     if returns_series.empty or len(returns_series) < 2:
-        return {"Sharpe Ratio": -np.inf} # Return negative infinity Sharpe if data is insufficient
+        return {"Sharpe Ratio": -np.inf}
     
-    # Ensure returns are in decimal form (0.01 instead of 1.0)
     daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
     
-    # 1. Cumulative Returns
+    # 1. Cumulative Returns, capped at 0 (representing total loss)
     cumulative_returns = (1 + daily_returns_decimal).cumprod()
+    cumulative_returns = cumulative_returns.clip(lower=0) 
+    
     total_return = (cumulative_returns.iloc[-1] - 1) * 100 
+    total_return = max(total_return, -100.0) # Hard cap return at -100%
 
-    # 2. Annualization (assuming input is daily data)
+    # 2. Annualization
     num_periods = len(daily_returns_decimal)
     
-    annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR / num_periods) - 1
-    annualized_return *= 100
+    # Annualized return needs to use the cumulative return adjusted for the cap
+    # We use the final cumulative multiplier (cumulative_returns.iloc[-1])
+    if cumulative_returns.iloc[-1] > 0:
+        annualized_return = ((cumulative_returns.iloc[-1])**(TRADING_DAYS_PER_YEAR / num_periods) - 1) * 100
+    else:
+        annualized_return = -100.0
 
     daily_volatility = daily_returns_decimal.std()
     annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 
 
-    # 3. Sharpe Ratio
+    # 3. Sharpe Ratio (Use the realized annualized return)
     risk_free_annual = risk_free_rate
-    sharpe_ratio = (annualized_return / 100 - risk_free_annual) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
+    # If volatility is zero (flat returns), Sharpe is only meaningful if return > risk_free
+    if annualized_volatility == 0:
+        sharpe_ratio = np.inf if annualized_return > (risk_free_annual * 100) else -np.inf
+    else:
+        sharpe_ratio = (annualized_return / 100 - risk_free_annual) / (annualized_volatility / 100)
 
-    # 4. Max Drawdown
-    cumulative_returns_index = cumulative_returns.copy()
-    peak = cumulative_returns_index.expanding(min_periods=1).max()
-    drawdown = (cumulative_returns_index - peak) / peak
-    max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
+    # 4. Max Drawdown (Reported as a POSITIVE percentage)
+    peak = cumulative_returns.expanding(min_periods=1).max()
+    drawdown = (peak - cumulative_returns) / peak
+    max_drawdown = drawdown.max() * 100 if not drawdown.empty else 0
+    max_drawdown = min(max_drawdown, 100.0) # Cap drawdown at 100%
 
     return {
         "Total Return (%)": total_return,
         "Annualized Return (%)": annualized_return,
         "Annualized Volatility (%)": annualized_volatility,
         "Sharpe Ratio": sharpe_ratio,
-        "Max Drawdown (%)": max_drawdown
+        "Max Drawdown (%)": max_drawdown # Now positive
     }
 
 # --- Sidebar: Authentication ---
@@ -605,7 +618,6 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
     
     best_sharpe = -np.inf
     best_params = None
-    best_results = None
     
     total_runs = sum(1 for s in short_ma_range for l in long_ma_range if l > s)
     progress_bar = st.progress(0, text="Starting optimization sweep...")
@@ -620,7 +632,8 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
                 _, metrics, _ = perform_backtest_simulation(df_historical, s_ma, l_ma)
                 current_sharpe = metrics.get('Sharpe Ratio', -np.inf)
                 
-                if current_sharpe > best_sharpe and not np.isnan(current_sharpe):
+                # Check for better Sharpe, ignoring NaN/Inf
+                if current_sharpe > best_sharpe and not np.isinf(current_sharpe) and not np.isnan(current_sharpe):
                     best_sharpe = current_sharpe
                     best_params = (s_ma, l_ma)
     
@@ -638,6 +651,8 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
             'status': 'success'
         }
     else:
+        # If all Sharpe ratios were -inf (meaning no positive returns, extreme losses, or zero volatility),
+        # we can't recommend an "optimal" strategy.
         return {'status': 'failed'}
 
 def render_backtester_tab(kite_client: KiteConnect | None):
@@ -701,7 +716,7 @@ def render_backtester_tab(kite_client: KiteConnect | None):
                 st.success(f"Optimization completed in {end_time - start_time:.2f} seconds.")
                 st.balloons()
             else:
-                st.error("Optimization failed. Data might be insufficient or returns were too volatile.")
+                st.error("Optimization failed. Could not find a strategy with a positive Sharpe Ratio within the tested range.")
 
 
     if st.session_state.get('backtest_results') is not None:
@@ -724,15 +739,25 @@ def render_backtester_tab(kite_client: KiteConnect | None):
         final_bh_value = initial_capital * (1 + (bh_metrics.get('Total Return (%)', 0) / 100))
 
         col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Strategy Total Return", f"{bt_metrics.get('Total Return (%)', 0):.2f}%", delta=f"Final Value: ₹{final_strategy_value:,.2f}")
-        col_m2.metric("Strategy Sharpe Ratio", f"{bt_metrics.get('Sharpe Ratio', 0):.2f}")
-        col_m3.metric("Strategy Max Drawdown", f"{bt_metrics.get('Max Drawdown (%)', 0):.2f}%")
+        
+        # Strategy Metrics
+        col_m1.metric("Strategy Total Return", f"{bt_metrics.get('Total Return (%)', 0):.2f}%", 
+                      delta=f"Final Value: ₹{final_strategy_value:,.2f}", 
+                      delta_color="inverse" if bt_metrics.get('Total Return (%)', 0) < 0 else "normal")
+        col_m2.metric("Strategy Sharpe Ratio", f"{bt_metrics.get('Sharpe Ratio', 0):.2f}",
+                      delta_color="inverse" if bt_metrics.get('Sharpe Ratio', 0) < 0 else "normal")
+        col_m3.metric("Strategy Max Drawdown", f"{bt_metrics.get('Max Drawdown (%)', 0):.2f}%", 
+                      help="Max Drawdown is now reported as a positive percentage, capped at 100%.")
         
         st.markdown("---")
 
+        # Buy & Hold Metrics
         col_b1, col_b2, col_b3 = st.columns(3)
-        col_b1.metric("Buy & Hold Total Return", f"{bh_metrics.get('Total Return (%)', 0):.2f}%", delta=f"Final Value: ₹{final_bh_value:,.2f}")
-        col_b2.metric("Buy & Hold Sharpe Ratio", f"{bh_metrics.get('Sharpe Ratio', 0):.2f}")
+        col_b1.metric("Buy & Hold Total Return", f"{bh_metrics.get('Total Return (%)', 0):.2f}%", 
+                      delta=f"Final Value: ₹{final_bh_value:,.2f}",
+                      delta_color="inverse" if bh_metrics.get('Total Return (%)', 0) < 0 else "normal")
+        col_b2.metric("Buy & Hold Sharpe Ratio", f"{bh_metrics.get('Sharpe Ratio', 0):.2f}",
+                      delta_color="inverse" if bh_metrics.get('Sharpe Ratio', 0) < 0 else "normal")
         col_b3.metric("Buy & Hold Max Drawdown", f"{bh_metrics.get('Max Drawdown (%)', 0):.2f}%")
         
         fig_backtest = go.Figure()
