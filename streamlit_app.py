@@ -15,7 +15,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
 from sklearn.preprocessing import MinMaxScaler 
-# import shap # Kept for professional context, but often slow in typical Streamlit setups
+import time # Used for timing the backtest
 
 # Supabase imports (Keeping them for completeness, though auth is simplified)
 from supabase import create_client, Client
@@ -23,7 +23,7 @@ from supabase import create_client, Client
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Invsion Connect - Algo Trading Platform", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect - High-Performance Algorithmic Trading Platform")
-st.markdown("Focused on high-speed data fetching, advanced ML prediction, and robust risk analysis. **Achieving near 100% precision requires continuous refinement and feature optimization.**")
+st.markdown("Focused on high-speed data fetching, advanced ML prediction, and robust risk analysis. **Automated configuration maximizes efficiency.**")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
@@ -210,7 +210,7 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.02) -> dict: # 2% RF rate default
     """Calculates comprehensive performance metrics for a series of returns."""
     if returns_series.empty or len(returns_series) < 2:
-        return {}
+        return {"Sharpe Ratio": -np.inf} # Return negative infinity Sharpe if data is insufficient
     
     # Ensure returns are in decimal form (0.01 instead of 1.0)
     daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
@@ -417,9 +417,11 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             
             if st.button(f"Train {model_type_selected} Model (High Speed)", key="train_ml_model_btn"):
                 model = model_options[model_type_selected]
+                start_time = time.time()
                 with st.spinner(f"Training {model_type_selected}..."):
                     model.fit(X_train_scaled, y_train)
                     y_pred = model.predict(X_test_scaled)
+                end_time = time.time()
                 
                 st.session_state["ml_model"] = model
                 st.session_state["y_test"] = y_test
@@ -429,7 +431,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 st.session_state["ml_model_type"] = model_type_selected
                 st.session_state["prediction_horizon"] = current_prediction_horizon 
                 st.session_state["X_train_raw"] = X_train_raw 
-                st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon} periods!")
+                st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon} periods in {end_time - start_time:.2f} seconds!")
         
         with col_ml_output:
             if st.session_state.get("ml_model") and st.session_state.get("y_test") is not None:
@@ -437,17 +439,15 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 rmse = np.sqrt(mse)
                 r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
                 
-                # --- FIX START: Ensure Directional Accuracy comparison is robust ---
+                # --- Directional Accuracy FIX ---
                 y_test_series = st.session_state['y_test']
                 y_pred_series = pd.Series(st.session_state['y_pred'], index=y_test_series.index)
 
                 # Calculate the sign of the difference, using .values to get NumPy arrays
-                # We use .values to bypass strict pandas index alignment which caused the error
                 actual_direction = np.sign(y_test_series.diff().dropna().values)
                 predicted_direction = np.sign(y_pred_series.diff().dropna().values)
                 
                 if len(actual_direction) > 0:
-                    # Compare the underlying NumPy arrays directly
                     directional_accuracy = (actual_direction == predicted_direction).mean() * 100
                 else:
                     directional_accuracy = 0
@@ -576,6 +576,70 @@ def render_risk_portfolio_tab(kite_client: KiteConnect | None):
         fig_var.update_layout(title_text=f'Daily Returns Distribution with 1-Day VaR', height=400, template="plotly_white")
         st.plotly_chart(fig_var, use_container_width=True)
 
+def perform_backtest_simulation(df_historical: pd.DataFrame, short_ma: int, long_ma: int):
+    """Core backtesting logic for a given set of parameters."""
+    df_backtest = df_historical.copy()
+    
+    df_backtest['Short_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=short_ma)
+    df_backtest['Long_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=long_ma)
+    
+    df_backtest['Signal'] = np.where(df_backtest['Short_MA'] > df_backtest['Long_MA'], 1.0, 0.0)
+    df_backtest['Position'] = df_backtest['Signal'].shift(1)
+    
+    df_backtest['Daily_Return'] = df_backtest['close'].pct_change()
+    df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position']
+    
+    df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return'].fillna(0)).cumprod()
+    df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'].fillna(0)).cumprod()
+    
+    metrics = calculate_performance_metrics(df_backtest['Strategy_Return'].dropna() * 100)
+    bh_metrics = calculate_performance_metrics(df_backtest['Daily_Return'].dropna() * 100)
+    
+    return df_backtest, metrics, bh_metrics
+
+def optimize_ma_crossover(df_historical: pd.DataFrame):
+    """Automates backtesting to find optimal MA parameters maximizing Sharpe Ratio."""
+    
+    short_ma_range = range(5, 30, 5) # 5, 10, 15, 20, 25
+    long_ma_range = range(40, 100, 10) # 40, 50, 60, 70, 80, 90
+    
+    best_sharpe = -np.inf
+    best_params = None
+    best_results = None
+    
+    total_runs = sum(1 for s in short_ma_range for l in long_ma_range if l > s)
+    progress_bar = st.progress(0, text="Starting optimization sweep...")
+    run_count = 0
+    
+    for s_ma in short_ma_range:
+        for l_ma in long_ma_range:
+            if l_ma > s_ma:
+                run_count += 1
+                progress_bar.progress(run_count / total_runs, text=f"Optimizing: Testing MA({s_ma}, {l_ma})...")
+                
+                _, metrics, _ = perform_backtest_simulation(df_historical, s_ma, l_ma)
+                current_sharpe = metrics.get('Sharpe Ratio', -np.inf)
+                
+                if current_sharpe > best_sharpe and not np.isnan(current_sharpe):
+                    best_sharpe = current_sharpe
+                    best_params = (s_ma, l_ma)
+    
+    progress_bar.progress(1.0, text="Optimization Complete.")
+    
+    if best_params:
+        # Re-run the simulation for the best parameters to get the full dataframe
+        df_best, best_metrics, bh_metrics = perform_backtest_simulation(df_historical, best_params[0], best_params[1])
+        return {
+            'optimal_short_ma': best_params[0],
+            'optimal_long_ma': best_params[1],
+            'df_results': df_best,
+            'bt_metrics': best_metrics,
+            'bh_metrics': bh_metrics,
+            'status': 'success'
+        }
+    else:
+        return {'status': 'failed'}
+
 def render_backtester_tab(kite_client: KiteConnect | None):
     st.header("4. Algorithmic Strategy Backtester")
     st.markdown("Test high-frequency, complex trading strategies against historical data for robust evaluation.")
@@ -587,48 +651,72 @@ def render_backtester_tab(kite_client: KiteConnect | None):
         st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
         return
 
-    st.subheader(f"Strategy: Dual Moving Average Crossover for {last_symbol} (High Speed Simulation)")
-    df_backtest = historical_data.copy()
+    st.subheader(f"Strategy: Dual Moving Average Crossover for {last_symbol}")
+
+    mode = st.radio("Select Backtesting Mode", ["Automated Optimization (Recommended)", "Manual Configuration"], index=0)
     
-    col_bt_params, col_bt_run = st.columns(2)
-    with col_bt_params:
-        short_ma = st.slider("Short MA Window", 5, 30, 10, key="bt_short_ma")
-        long_ma = st.slider("Long MA Window", 30, 100, 50, key="bt_long_ma")
-        initial_capital = st.number_input("Initial Capital (₹)", min_value=10000, value=100000, step=10000)
+    initial_capital = st.number_input("Initial Capital (₹)", min_value=10000, value=100000, step=10000, key="bt_capital")
+
     
-    with col_bt_run:
-        if st.button("Run High-Speed Backtest", key="run_backtest_btn"):
-            if len(df_backtest) < long_ma:
-                st.error("Not enough data for the selected long MA window.")
-                return
-            
-            with st.spinner("Calculating strategy performance & professional metrics..."):
-                df_backtest['Short_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=short_ma)
-                df_backtest['Long_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=long_ma)
+    if mode == "Manual Configuration":
+        col_bt_params, col_bt_run = st.columns(2)
+        with col_bt_params:
+            short_ma = st.slider("Short MA Window", 5, 30, 10, key="bt_short_ma_manual")
+            long_ma = st.slider("Long MA Window", 30, 100, 50, key="bt_long_ma_manual")
+        
+        with col_bt_run:
+            if st.button("Run Manual Backtest", key="run_backtest_btn_manual"):
+                if len(historical_data) < long_ma:
+                    st.error("Not enough data for the selected long MA window.")
+                    return
                 
-                # Signal: 1 for Buy (Short > Long), 0 for Sell/Exit
-                df_backtest['Signal'] = np.where(df_backtest['Short_MA'] > df_backtest['Long_MA'], 1.0, 0.0)
-                df_backtest['Position'] = df_backtest['Signal'].shift(1)
+                start_time = time.time()
+                with st.spinner("Calculating strategy performance..."):
+                    df_results, bt_metrics, bh_metrics = perform_backtest_simulation(historical_data, short_ma, long_ma)
+                end_time = time.time()
                 
-                # Calculate daily returns for the asset and the strategy
-                df_backtest['Daily_Return'] = df_backtest['close'].pct_change()
-                df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position']
-                
-                # Calculate cumulative returns
-                df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return'].fillna(0)).cumprod()
-                df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'].fillna(0)).cumprod()
-                
-                st.session_state['backtest_results'] = df_backtest
-                st.session_state['bt_metrics'] = calculate_performance_metrics(df_backtest['Strategy_Return'].dropna() * 100)
-                st.session_state['bh_metrics'] = calculate_performance_metrics(df_backtest['Daily_Return'].dropna() * 100)
+                st.session_state['backtest_results'] = df_results
+                st.session_state['bt_metrics'] = bt_metrics
+                st.session_state['bh_metrics'] = bh_metrics
                 st.session_state['initial_capital'] = initial_capital
-                st.success("Backtest completed. Check performance metrics below.")
+                st.session_state['bt_mode'] = 'Manual'
+                st.session_state['bt_time'] = end_time - start_time
+                st.success(f"Manual Backtest completed in {end_time - start_time:.2f} seconds.")
+
+    elif mode == "Automated Optimization (Recommended)":
+        st.markdown("Automated mode sweeps over parameters (5-30 Short MA, 40-100 Long MA) to maximize Sharpe Ratio.")
+        if st.button("Run Automated Optimization (Maximize Sharpe)", key="run_optimization_btn"):
+            start_time = time.time()
+            optimization_results = optimize_ma_crossover(historical_data)
+            end_time = time.time()
+            
+            if optimization_results['status'] == 'success':
+                st.session_state['backtest_results'] = optimization_results['df_results']
+                st.session_state['bt_metrics'] = optimization_results['bt_metrics']
+                st.session_state['bh_metrics'] = optimization_results['bh_metrics']
+                st.session_state['initial_capital'] = initial_capital
+                st.session_state['bt_mode'] = 'Optimized'
+                st.session_state['bt_time'] = end_time - start_time
+                st.session_state['optimal_params'] = (optimization_results['optimal_short_ma'], optimization_results['optimal_long_ma'])
+                st.success(f"Optimization completed in {end_time - start_time:.2f} seconds.")
+                st.balloons()
+            else:
+                st.error("Optimization failed. Data might be insufficient or returns were too volatile.")
+
 
     if st.session_state.get('backtest_results') is not None:
         df_results = st.session_state['backtest_results']
         bt_metrics = st.session_state['bt_metrics']
         bh_metrics = st.session_state['bh_metrics']
         initial_capital = st.session_state['initial_capital']
+        mode_used = st.session_state.get('bt_mode', 'N/A')
+        
+        if mode_used == 'Optimized':
+            s_ma, l_ma = st.session_state['optimal_params']
+            st.markdown(f"#### ✅ Optimal Strategy Found: MA({s_ma}, {l_ma})")
+        else:
+            st.markdown("#### Manual Strategy Results")
+
 
         st.markdown("##### Strategy vs. Buy & Hold Professional Metrics")
         
