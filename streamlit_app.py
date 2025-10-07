@@ -28,6 +28,7 @@ st.markdown("Focused on high-speed data fetching, advanced ML prediction, and ro
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
+RISK_FREE_RATE = 0.02 # 2% for Sharpe calculation
 
 # Initialize standard session state variables
 if "kite_access_token" not in st.session_state:
@@ -75,7 +76,6 @@ KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
 # --- Supabase Client Initialization ---
 @st.cache_resource(ttl=3600)
 def init_supabase_client(url: str, key: str) -> Client:
-    # Requires Supabase secrets to be configured
     return create_client(url, key)
 
 if SUPABASE_CREDENTIALS.get("url"):
@@ -84,7 +84,6 @@ if SUPABASE_CREDENTIALS.get("url"):
     except Exception as e:
         supabase = None
 else:
-    # Placeholder for unconfigured Supabase
     supabase = None
 
 # --- KiteConnect Client Initialization (Unauthenticated for login URL) ---
@@ -155,7 +154,7 @@ def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = 
     hits = df[mask]
     return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
 
-# --- ENHANCED FEATURE ENGINEERING for higher precision ---
+# --- ENHANCED FEATURE ENGINEERING ---
 def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or 'close' not in df.columns:
         return pd.DataFrame()
@@ -168,7 +167,6 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     macd_obj = ta.trend.MACD(df_copy['close'], window_fast=12, window_slow=26, window_sign=9)
     df_copy['MACD'] = macd_obj.macd()
     df_copy['ADX'] = ta.trend.adx(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
-    # Ichimoku B can be calculated without shift, A/B are components of the cloud
     df_copy['Ichimoku_B'] = ta.trend.ichimoku_b(df_copy['high'], df_copy['low'], window3=52)
     
     # --- 2. Volatility & Bands ---
@@ -187,76 +185,70 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     df_copy['VWAP'] = ta.volume.volume_weighted_average_price(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14)
     df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
     
-    # --- 5. Lagged Prices and Returns (Increased Lag for better context) ---
+    # --- 5. Lagged Prices and Returns ---
     for lag in [1, 2, 3, 5, 10, 20]: 
         df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
         df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) 
 
-    # --- 6. Temporal Features (Crucial for time series) ---
+    # --- 6. Temporal Features ---
     if df_copy.index.inferred_type == 'datetime64':
-        # Day of week (0=Mon, 4=Fri)
         df_copy['day_of_week'] = df_copy.index.dayofweek
-        # Cyclical transformation for better periodic learning
         df_copy['sin_day'] = np.sin(2 * np.pi * df_copy['day_of_week'] / 7)
         df_copy['cos_day'] = np.cos(2 * np.pi * df_copy['day_of_week'] / 7)
         df_copy.drop(columns=['day_of_week'], inplace=True)
     
-    # Robust Imputation for features that required lookback windows
     df_copy.fillna(method='bfill', inplace=True)
     df_copy.fillna(method='ffill', inplace=True)
     df_copy.dropna(inplace=True) 
     return df_copy
 
-def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.02) -> dict: # 2% RF rate default
-    """
-    Calculates comprehensive performance metrics for a series of returns.
-    FIXED: Caps loss at 100% and reports Max Drawdown as a positive value.
-    """
+def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> dict:
+    """Calculates comprehensive performance metrics for a series of returns."""
     if returns_series.empty or len(returns_series) < 2:
         return {"Sharpe Ratio": -np.inf}
     
+    # Ensure returns are in decimal form (0.01 instead of 1.0)
     daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
     
-    # 1. Cumulative Returns, capped at 0 (representing total loss)
-    cumulative_returns = (1 + daily_returns_decimal).cumprod()
-    cumulative_returns = cumulative_returns.clip(lower=0) 
-    
-    total_return = (cumulative_returns.iloc[-1] - 1) * 100 
-    total_return = max(total_return, -100.0) # Hard cap return at -100%
+    # 1. Cumulative Returns (Used for calculation, NOT capped at 0 yet)
+    cumulative_multiplier = (1 + daily_returns_decimal).cumprod()
 
-    # 2. Annualization
+    # 2. Total Return (Capped at -100%)
+    total_return = (cumulative_multiplier.iloc[-1] - 1) * 100 
+    total_return = max(total_return, -100.0)
+
+    # 3. Annualization
     num_periods = len(daily_returns_decimal)
     
-    # Annualized return needs to use the cumulative return adjusted for the cap
-    # We use the final cumulative multiplier (cumulative_returns.iloc[-1])
-    if cumulative_returns.iloc[-1] > 0:
-        annualized_return = ((cumulative_returns.iloc[-1])**(TRADING_DAYS_PER_YEAR / num_periods) - 1) * 100
+    # Use the final multiplier for annualized return calculation
+    if cumulative_multiplier.iloc[-1] > 0:
+        annualized_return = ((cumulative_multiplier.iloc[-1])**(TRADING_DAYS_PER_YEAR / num_periods) - 1) * 100
     else:
         annualized_return = -100.0
 
     daily_volatility = daily_returns_decimal.std()
     annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 
 
-    # 3. Sharpe Ratio (Use the realized annualized return)
-    risk_free_annual = risk_free_rate
-    # If volatility is zero (flat returns), Sharpe is only meaningful if return > risk_free
+    # 4. Sharpe Ratio
     if annualized_volatility == 0:
-        sharpe_ratio = np.inf if annualized_return > (risk_free_annual * 100) else -np.inf
+        sharpe_ratio = np.inf if annualized_return > (risk_free_rate * 100) else -np.inf
     else:
-        sharpe_ratio = (annualized_return / 100 - risk_free_annual) / (annualized_volatility / 100)
+        sharpe_ratio = (annualized_return / 100 - risk_free_rate) / (annualized_volatility / 100)
 
-    # 4. Max Drawdown (Reported as a POSITIVE percentage)
-    peak = cumulative_returns.expanding(min_periods=1).max()
-    drawdown = (peak - cumulative_returns) / peak
+    # 5. Max Drawdown (Calculated on positive cumulative return, reported as positive percentage, capped at 100%)
+    # Use the cumulative multiplier clipped at zero for realistic drawdown calculation
+    cumulative_multiplier_capped = cumulative_multiplier.clip(lower=0)
+    peak = cumulative_multiplier_capped.expanding(min_periods=1).max()
+    drawdown = (peak - cumulative_multiplier_capped) / peak
     max_drawdown = drawdown.max() * 100 if not drawdown.empty else 0
-    max_drawdown = min(max_drawdown, 100.0) # Cap drawdown at 100%
+    max_drawdown = min(max_drawdown, 100.0) 
 
     return {
         "Total Return (%)": total_return,
         "Annualized Return (%)": annualized_return,
         "Annualized Volatility (%)": annualized_volatility,
         "Sharpe Ratio": sharpe_ratio,
-        "Max Drawdown (%)": max_drawdown # Now positive
+        "Max Drawdown (%)": max_drawdown 
     }
 
 # --- Sidebar: Authentication ---
@@ -567,7 +559,6 @@ def render_risk_portfolio_tab(kite_client: KiteConnect | None):
         holding_period_var = st.number_input("Holding Period for VaR (days)", min_value=1, value=5, step=1, key="risk_holding_period_var")
         
         # Historical VaR Calculation
-        # The percentile gives the worst loss observed at that confidence level (e.g., 1% percentile for 99% confidence)
         var_percentile_1day = np.percentile(daily_returns, 100 - confidence_level) 
         
         # Scaling VaR for multi-day periods (square root rule)
@@ -590,21 +581,37 @@ def render_risk_portfolio_tab(kite_client: KiteConnect | None):
         st.plotly_chart(fig_var, use_container_width=True)
 
 def perform_backtest_simulation(df_historical: pd.DataFrame, short_ma: int, long_ma: int):
-    """Core backtesting logic for a given set of parameters."""
+    """Core backtesting logic with explicit portfolio tracking to prevent loss > 100%."""
     df_backtest = df_historical.copy()
     
     df_backtest['Short_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=short_ma)
     df_backtest['Long_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=long_ma)
     
+    # Generate signal (1=long, 0=cash/flat)
     df_backtest['Signal'] = np.where(df_backtest['Short_MA'] > df_backtest['Long_MA'], 1.0, 0.0)
     df_backtest['Position'] = df_backtest['Signal'].shift(1)
     
+    # Calculate daily returns
     df_backtest['Daily_Return'] = df_backtest['close'].pct_change()
-    df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position']
     
-    df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return'].fillna(0)).cumprod()
+    # Strategy return: only applies when in position
+    df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position'].fillna(0)
+    df_backtest.iloc[0, df_backtest.columns.get_loc('Strategy_Return')] = 0 # Ensure first return is 0
+
+    # Calculate Cumulative Value (starting at 1) with cap at 0
+    cumulative_value = [1.0]
+    for r in df_backtest['Strategy_Return'].iloc[1:]:
+        new_value = cumulative_value[-1] * (1 + r)
+        # Enforce no loss greater than 100% (cannot go below zero)
+        cumulative_value.append(max(0.0, new_value)) 
+        
+    df_backtest['Cumulative_Strategy_Return'] = cumulative_value
+
+    # Buy & Hold (Benchmark)
     df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'].fillna(0)).cumprod()
+    df_backtest['Cumulative_Buy_Hold_Return'] = df_backtest['Cumulative_Buy_Hold_Return'].clip(lower=0)
     
+    # Metrics calculation uses the *daily return series* (R * Position)
     metrics = calculate_performance_metrics(df_backtest['Strategy_Return'].dropna() * 100)
     bh_metrics = calculate_performance_metrics(df_backtest['Daily_Return'].dropna() * 100)
     
@@ -613,8 +620,9 @@ def perform_backtest_simulation(df_historical: pd.DataFrame, short_ma: int, long
 def optimize_ma_crossover(df_historical: pd.DataFrame):
     """Automates backtesting to find optimal MA parameters maximizing Sharpe Ratio."""
     
-    short_ma_range = range(5, 30, 5) # 5, 10, 15, 20, 25
-    long_ma_range = range(40, 100, 10) # 40, 50, 60, 70, 80, 90
+    # Optimization Ranges
+    short_ma_range = range(5, 31, 5) # 5, 10, 15, 20, 25, 30
+    long_ma_range = range(40, 101, 10) # 40, 50, 60, 70, 80, 90, 100
     
     best_sharpe = -np.inf
     best_params = None
@@ -632,7 +640,6 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
                 _, metrics, _ = perform_backtest_simulation(df_historical, s_ma, l_ma)
                 current_sharpe = metrics.get('Sharpe Ratio', -np.inf)
                 
-                # Check for better Sharpe, ignoring NaN/Inf
                 if current_sharpe > best_sharpe and not np.isinf(current_sharpe) and not np.isnan(current_sharpe):
                     best_sharpe = current_sharpe
                     best_params = (s_ma, l_ma)
@@ -640,7 +647,6 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
     progress_bar.progress(1.0, text="Optimization Complete.")
     
     if best_params:
-        # Re-run the simulation for the best parameters to get the full dataframe
         df_best, best_metrics, bh_metrics = perform_backtest_simulation(df_historical, best_params[0], best_params[1])
         return {
             'optimal_short_ma': best_params[0],
@@ -651,8 +657,6 @@ def optimize_ma_crossover(df_historical: pd.DataFrame):
             'status': 'success'
         }
     else:
-        # If all Sharpe ratios were -inf (meaning no positive returns, extreme losses, or zero volatility),
-        # we can't recommend an "optimal" strategy.
         return {'status': 'failed'}
 
 def render_backtester_tab(kite_client: KiteConnect | None):
@@ -716,7 +720,7 @@ def render_backtester_tab(kite_client: KiteConnect | None):
                 st.success(f"Optimization completed in {end_time - start_time:.2f} seconds.")
                 st.balloons()
             else:
-                st.error("Optimization failed. Could not find a strategy with a positive Sharpe Ratio within the tested range.")
+                st.error("Optimization failed. Could not find a strategy with a non-negative Sharpe Ratio within the tested range.")
 
 
     if st.session_state.get('backtest_results') is not None:
@@ -761,26 +765,9 @@ def render_backtester_tab(kite_client: KiteConnect | None):
         col_b3.metric("Buy & Hold Max Drawdown", f"{bh_metrics.get('Max Drawdown (%)', 0):.2f}%")
         
         fig_backtest = go.Figure()
-        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Strategy_Return'] * 100 - 100, name='Strategy Return (%)', line=dict(color='green', width=2)))
-        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Buy_Hold_Return'] * 100 - 100, name='Buy & Hold (%)', line=dict(dash='dash', color='blue')))
+        # Plot cumulative returns (which are capped at 0 in the simulation)
+        # Note: We plot (Cumulative_Value * 100) - 100 to show return percentage from zero.
+        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=(df_results['Cumulative_Strategy_Return'] * 100) - 100, name='Strategy Return (%)', line=dict(color='green', width=2)))
+        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=(df_results['Cumulative_Buy_Hold_Return'] * 100) - 100, name='Buy & Hold (%)', line=dict(dash='dash', color='blue')))
         fig_backtest.update_layout(title_text=f"Cumulative Returns Comparison (Initial Capital: ₹{initial_capital:,.0f})", height=500, template="plotly_white", yaxis_title="Cumulative Return (%)")
         st.plotly_chart(fig_backtest, use_container_width=True)
-
-
-# --- Main Application Logic (Tab Rendering) ---
-api_key = KITE_CREDENTIALS["api_key"]
-access_token = st.session_state["kite_access_token"]
-
-# Define all four primary tabs for the algorithmic platform
-tabs = st.tabs([
-    "Market Data & Historical Data", 
-    "High-Frequency ML Predictor", 
-    "Risk & Portfolio Analytics", 
-    "Algorithmic Strategy Backtester"
-])
-tab_market, tab_ml, tab_risk, tab_backtester = tabs
-
-with tab_market: render_market_historical_tab(k, api_key, access_token)
-with tab_ml: render_price_predictor_tab(k, api_key, access_token)
-with tab_risk: render_risk_portfolio_tab(k)
-with tab_backtester: render_backtester_tab(k)
