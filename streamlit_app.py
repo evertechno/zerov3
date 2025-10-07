@@ -71,7 +71,16 @@ def load_secrets():
     # Simplified credential checks for deployment integrity
     return kite_conf, supabase_conf
 
-KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
+# NOTE: KITE_CREDENTIALS must be defined in your Streamlit secrets environment 
+# for this code to run successfully beyond the front-end display.
+try:
+    KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
+except Exception as e:
+    st.error(f"Failed to load secrets: {e}. Please ensure Streamlit secrets are configured.")
+    # Provide placeholders to prevent script crash if secrets are missing but allow UI display
+    KITE_CREDENTIALS = {"api_key": "DUMMY_KEY", "api_secret": "DUMMY_SECRET"}
+    SUPABASE_CREDENTIALS = {"url": None, "anon_key": None}
+
 
 # --- Supabase Client Initialization ---
 @st.cache_resource(ttl=3600)
@@ -205,14 +214,15 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> dict:
     """Calculates comprehensive performance metrics for a series of returns."""
     if returns_series.empty or len(returns_series) < 2:
-        return {"Sharpe Ratio": -np.inf}
+        return {"Sharpe Ratio": -np.inf, "Total Return (%)": -100.0, "Max Drawdown (%)": 100.0}
     
-    # Ensure returns are in decimal form (0.01 instead of 1.0)
     daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
     
-    # 1. Cumulative Returns (Used for calculation, NOT capped at 0 yet)
+    # 1. Cumulative Multiplier (Crucial: This series MUST reflect the simulation cap at 0)
+    # We rely on the calling function (perform_backtest_simulation) to provide a clean return series
+    # whose cumulative value does not exceed 100% loss.
     cumulative_multiplier = (1 + daily_returns_decimal).cumprod()
-
+    
     # 2. Total Return (Capped at -100%)
     total_return = (cumulative_multiplier.iloc[-1] - 1) * 100 
     total_return = max(total_return, -100.0)
@@ -220,7 +230,6 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     # 3. Annualization
     num_periods = len(daily_returns_decimal)
     
-    # Use the final multiplier for annualized return calculation
     if cumulative_multiplier.iloc[-1] > 0:
         annualized_return = ((cumulative_multiplier.iloc[-1])**(TRADING_DAYS_PER_YEAR / num_periods) - 1) * 100
     else:
@@ -235,8 +244,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     else:
         sharpe_ratio = (annualized_return / 100 - risk_free_rate) / (annualized_volatility / 100)
 
-    # 5. Max Drawdown (Calculated on positive cumulative return, reported as positive percentage, capped at 100%)
-    # Use the cumulative multiplier clipped at zero for realistic drawdown calculation
+    # 5. Max Drawdown (Calculated on the cumulative multiplier, reported as positive, capped at 100%)
     cumulative_multiplier_capped = cumulative_multiplier.clip(lower=0)
     peak = cumulative_multiplier_capped.expanding(min_periods=1).max()
     drawdown = (peak - cumulative_multiplier_capped) / peak
@@ -448,7 +456,6 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 y_test_series = st.session_state['y_test']
                 y_pred_series = pd.Series(st.session_state['y_pred'], index=y_test_series.index)
 
-                # Calculate the sign of the difference, using .values to get NumPy arrays
                 actual_direction = np.sign(y_test_series.diff().dropna().values)
                 predicted_direction = np.sign(y_pred_series.diff().dropna().values)
                 
@@ -592,15 +599,14 @@ def perform_backtest_simulation(df_historical: pd.DataFrame, short_ma: int, long
     df_backtest['Position'] = df_backtest['Signal'].shift(1)
     
     # Calculate daily returns
-    df_backtest['Daily_Return'] = df_backtest['close'].pct_change()
+    df_backtest['Daily_Return'] = df_backtest['close'].pct_change().fillna(0)
     
     # Strategy return: only applies when in position
-    df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position'].fillna(0)
-    df_backtest.iloc[0, df_backtest.columns.get_loc('Strategy_Return')] = 0 # Ensure first return is 0
-
+    df_backtest['Strategy_Return_Decimal'] = df_backtest['Daily_Return'] * df_backtest['Position'].fillna(0)
+    
     # Calculate Cumulative Value (starting at 1) with cap at 0
     cumulative_value = [1.0]
-    for r in df_backtest['Strategy_Return'].iloc[1:]:
+    for r in df_backtest['Strategy_Return_Decimal'].iloc[1:]:
         new_value = cumulative_value[-1] * (1 + r)
         # Enforce no loss greater than 100% (cannot go below zero)
         cumulative_value.append(max(0.0, new_value)) 
@@ -608,12 +614,15 @@ def perform_backtest_simulation(df_historical: pd.DataFrame, short_ma: int, long
     df_backtest['Cumulative_Strategy_Return'] = cumulative_value
 
     # Buy & Hold (Benchmark)
-    df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'].fillna(0)).cumprod()
+    df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return']).cumprod()
     df_backtest['Cumulative_Buy_Hold_Return'] = df_backtest['Cumulative_Buy_Hold_Return'].clip(lower=0)
     
-    # Metrics calculation uses the *daily return series* (R * Position)
-    metrics = calculate_performance_metrics(df_backtest['Strategy_Return'].dropna() * 100)
-    bh_metrics = calculate_performance_metrics(df_backtest['Daily_Return'].dropna() * 100)
+    # Metrics calculation uses the *decimal return series* converted to percentage for consistency
+    strategy_returns_percent = df_backtest['Strategy_Return_Decimal'].copy()
+    strategy_returns_percent.iloc[1:] = strategy_returns_percent.iloc[1:] * 100
+    
+    metrics = calculate_performance_metrics(strategy_returns_percent)
+    bh_metrics = calculate_performance_metrics(df_backtest['Daily_Return'] * 100)
     
     return df_backtest, metrics, bh_metrics
 
@@ -766,8 +775,27 @@ def render_backtester_tab(kite_client: KiteConnect | None):
         
         fig_backtest = go.Figure()
         # Plot cumulative returns (which are capped at 0 in the simulation)
-        # Note: We plot (Cumulative_Value * 100) - 100 to show return percentage from zero.
         fig_backtest.add_trace(go.Scatter(x=df_results.index, y=(df_results['Cumulative_Strategy_Return'] * 100) - 100, name='Strategy Return (%)', line=dict(color='green', width=2)))
         fig_backtest.add_trace(go.Scatter(x=df_results.index, y=(df_results['Cumulative_Buy_Hold_Return'] * 100) - 100, name='Buy & Hold (%)', line=dict(dash='dash', color='blue')))
         fig_backtest.update_layout(title_text=f"Cumulative Returns Comparison (Initial Capital: ₹{initial_capital:,.0f})", height=500, template="plotly_white", yaxis_title="Cumulative Return (%)")
         st.plotly_chart(fig_backtest, use_container_width=True)
+
+
+# --- Main Application Logic (Tab Rendering) ---
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+# Define all four primary tabs for the algorithmic platform
+# This section ensures the tabs are correctly defined and rendered.
+tabs = st.tabs([
+    "Market Data & Historical Data", 
+    "High-Frequency ML Predictor", 
+    "Risk & Portfolio Analytics", 
+    "Algorithmic Strategy Backtester"
+])
+tab_market, tab_ml, tab_risk, tab_backtester = tabs
+
+with tab_market: render_market_historical_tab(k, api_key, access_token)
+with tab_ml: render_price_predictor_tab(k, api_key, access_token)
+with tab_risk: render_risk_portfolio_tab(k)
+with tab_backtester: render_backtester_tab(k)
