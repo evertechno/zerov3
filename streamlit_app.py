@@ -437,16 +437,21 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 rmse = np.sqrt(mse)
                 r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
                 
-                # Accuracy based on direction prediction
-                actual_direction = np.sign(st.session_state['y_test'].diff().dropna())
-                predicted_direction = np.sign(pd.Series(st.session_state['y_pred']).diff().dropna())
+                # --- FIX START: Ensure Directional Accuracy comparison is robust ---
+                y_test_series = st.session_state['y_test']
+                y_pred_series = pd.Series(st.session_state['y_pred'], index=y_test_series.index)
+
+                # Calculate the sign of the difference, using .values to get NumPy arrays
+                # We use .values to bypass strict pandas index alignment which caused the error
+                actual_direction = np.sign(y_test_series.diff().dropna().values)
+                predicted_direction = np.sign(y_pred_series.diff().dropna().values)
                 
-                if not actual_direction.empty and not predicted_direction.empty:
-                    # Align indices/length for comparison
-                    min_len = min(len(actual_direction), len(predicted_direction))
-                    directional_accuracy = (actual_direction.iloc[:min_len] == predicted_direction.iloc[:min_len]).mean() * 100
+                if len(actual_direction) > 0:
+                    # Compare the underlying NumPy arrays directly
+                    directional_accuracy = (actual_direction == predicted_direction).mean() * 100
                 else:
                     directional_accuracy = 0
+                # --- FIX END ---
 
                 st.markdown(f"##### Evaluation Metrics ({st.session_state['prediction_horizon']} periods ahead)")
                 col_m_r, col_m_a = st.columns(2)
@@ -666,4 +671,3 @@ with tab_market: render_market_historical_tab(k, api_key, access_token)
 with tab_ml: render_price_predictor_tab(k, api_key, access_token)
 with tab_risk: render_risk_portfolio_tab(k)
 with tab_backtester: render_backtester_tab(k)
-
