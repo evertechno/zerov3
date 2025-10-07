@@ -15,7 +15,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
 import ta  # Technical Analysis library
 from sklearn.preprocessing import MinMaxScaler 
-import shap # To calculate feature importance (if available)
+# import shap # Kept for professional context, but often slow in typical Streamlit setups
 
 # Supabase imports (Keeping them for completeness, though auth is simplified)
 from supabase import create_client, Client
@@ -23,7 +23,7 @@ from supabase import create_client, Client
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Invsion Connect - Algo Trading Platform", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect - High-Performance Algorithmic Trading Platform")
-st.markdown("Focused on high-speed data fetching, advanced ML prediction, and robust risk analysis.")
+st.markdown("Focused on high-speed data fetching, advanced ML prediction, and robust risk analysis. **Achieving near 100% precision requires continuous refinement and feature optimization.**")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
@@ -54,10 +54,12 @@ if "y_test" not in st.session_state:
     st.session_state["y_test"] = None
 if "y_pred" not in st.session_state:
     st.session_state["y_pred"] = None
-if "X_test_scaled" not in st.session_state:
-    st.session_state["X_test_scaled"] = None
 if "ml_features" not in st.session_state:
     st.session_state["ml_features"] = []
+if "ml_model_type" not in st.session_state:
+    st.session_state["ml_model_type"] = None
+if "X_train_raw" not in st.session_state: # Used for feature importance
+    st.session_state["X_train_raw"] = pd.DataFrame()
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -77,7 +79,10 @@ def init_supabase_client(url: str, key: str) -> Client:
     return create_client(url, key)
 
 if SUPABASE_CREDENTIALS.get("url"):
-    supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["anon_key"])
+    try:
+        supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["anon_key"])
+    except Exception as e:
+        supabase = None
 else:
     # Placeholder for unconfigured Supabase
     supabase = None
@@ -163,59 +168,74 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     macd_obj = ta.trend.MACD(df_copy['close'], window_fast=12, window_slow=26, window_sign=9)
     df_copy['MACD'] = macd_obj.macd()
     df_copy['ADX'] = ta.trend.adx(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
-    df_copy['Ichimoku_A'] = ta.trend.ichimoku_a(df_copy['high'], df_copy['low'], window1=9, window2=26).shift(26)
+    # Ichimoku B can be calculated without shift, A/B are components of the cloud
+    df_copy['Ichimoku_B'] = ta.trend.ichimoku_b(df_copy['high'], df_copy['low'], window3=52)
     
     # --- 2. Volatility & Bands ---
-    df_copy['Bollinger_High'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_hband()
-    df_copy['Bollinger_Width'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_wband()
+    bb = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2)
+    df_copy['Bollinger_Width'] = bb.bollinger_wband()
     df_copy['ATR'] = ta.volatility.average_true_range(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+    df_copy['Keltner_Channel'] = ta.volatility.keltner_channel_wband(df_copy['high'], df_copy['low'], df_copy['close'])
     
     # --- 3. Momentum & Oscillation ---
     df_copy['RSI_14'] = ta.momentum.rsi(df_copy['close'], window=14)
     df_copy['Stoch_RSI'] = ta.momentum.stochrsi(df_copy['close'], window=14)
     df_copy['MFI'] = ta.volume.money_flow_index(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'])
+    df_copy['PPO'] = ta.momentum.ppo(df_copy['close'])
     
     # --- 4. Volume & Flow ---
     df_copy['VWAP'] = ta.volume.volume_weighted_average_price(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14)
     df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
     
     # --- 5. Lagged Prices and Returns (Increased Lag for better context) ---
-    for lag in [1, 2, 5, 10, 20]: 
+    for lag in [1, 2, 3, 5, 10, 20]: 
         df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
-        df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) * 100
+        df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) 
 
     # --- 6. Temporal Features (Crucial for time series) ---
     if df_copy.index.inferred_type == 'datetime64':
+        # Day of week (0=Mon, 4=Fri)
         df_copy['day_of_week'] = df_copy.index.dayofweek
-        df_copy['day_of_month'] = df_copy.index.day
-        # Convert cyclical features (optional but good practice)
+        # Cyclical transformation for better periodic learning
         df_copy['sin_day'] = np.sin(2 * np.pi * df_copy['day_of_week'] / 7)
+        df_copy['cos_day'] = np.cos(2 * np.pi * df_copy['day_of_week'] / 7)
         df_copy.drop(columns=['day_of_week'], inplace=True)
     
+    # Robust Imputation for features that required lookback windows
     df_copy.fillna(method='bfill', inplace=True)
     df_copy.fillna(method='ffill', inplace=True)
     df_copy.dropna(inplace=True) 
     return df_copy
 
-def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.0) -> dict:
+def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.02) -> dict: # 2% RF rate default
+    """Calculates comprehensive performance metrics for a series of returns."""
     if returns_series.empty or len(returns_series) < 2:
         return {}
     
-    daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 1 else returns_series
-    cumulative_returns = (1 + daily_returns_decimal).cumprod() - 1
-    total_return = cumulative_returns.iloc[-1] * 100 if not cumulative_returns.empty else 0
+    # Ensure returns are in decimal form (0.01 instead of 1.0)
+    daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
+    
+    # 1. Cumulative Returns
+    cumulative_returns = (1 + daily_returns_decimal).cumprod()
+    total_return = (cumulative_returns.iloc[-1] - 1) * 100 
 
+    # 2. Annualization (assuming input is daily data)
     num_periods = len(daily_returns_decimal)
-    annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR / num_periods) - 1 if num_periods > 0 and (1 + daily_returns_decimal).min() > 0 else 0
+    
+    annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR / num_periods) - 1
     annualized_return *= 100
 
     daily_volatility = daily_returns_decimal.std()
-    annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 if daily_volatility is not None else 0
+    annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 
 
-    sharpe_ratio = (annualized_return / 100 - risk_free_rate / 100) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
+    # 3. Sharpe Ratio
+    risk_free_annual = risk_free_rate
+    sharpe_ratio = (annualized_return / 100 - risk_free_annual) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
 
-    peak = cumulative_returns.expanding(min_periods=1).max()
-    drawdown = (cumulative_returns - peak) / (peak + 1)
+    # 4. Max Drawdown
+    cumulative_returns_index = cumulative_returns.copy()
+    peak = cumulative_returns_index.expanding(min_periods=1).max()
+    drawdown = (cumulative_returns_index - peak) / peak
     max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
 
     return {
@@ -255,15 +275,13 @@ with st.sidebar:
 # --- Authenticated KiteConnect client ---
 k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
-# --- Tab Functions (Kept modular) ---
+# --- Tab Functions ---
 
 def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    # (Content remains mostly the same as previous functional version, ensuring data fetching is robust)
     st.header("1. Market Data & Historical Data (High Speed)")
     if not kite_client:
         st.info("Login first to fetch market data.")
         return
-    # ... [rest of the market_historical_tab content] ...
     
     st.subheader("Historical Price Data")
     
@@ -285,7 +303,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
                 if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
                     st.session_state["historical_data"] = df_hist
                     st.session_state["last_fetched_symbol"] = hist_symbol
-                    # Reset ML state
+                    # Reset ML state upon new data fetch
                     st.session_state["ml_data"] = pd.DataFrame()
                     st.session_state["ml_model"] = None
                     st.session_state["scaler"] = None
@@ -297,8 +315,13 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         if not st.session_state.get("historical_data", pd.DataFrame()).empty:
             df = st.session_state["historical_data"]
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            
+            # Candlestick chart
             fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Candlestick'), row=1, col=1)
+            
+            # Volume bar chart
             fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color='blue'), row=2, col=1)
+            
             fig.update_layout(title_text=f"Historical Price & Volume for {st.session_state['last_fetched_symbol']}", xaxis_rangeslider_visible=False, height=600, template="plotly_white")
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -306,7 +329,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
 
 
 def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("2. High-Frequency ML Predictor (Seeking 100% Precision)")
+    st.header("2. High-Frequency ML Predictor (Seeking Near 100% Precision)")
     st.markdown("Utilizing optimized Gradient Boosting (LightGBM) and extensive feature engineering for the highest prediction accuracy.")
     
     if not kite_client:
@@ -325,7 +348,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
     col_feat_eng, col_prep = st.columns(2)
     with col_feat_eng:
         if st.button("Generate Extensive Algorithmic Features (Blazing Fast)", key="generate_features_btn"):
-            with st.spinner("Generating 20+ features..."):
+            with st.spinner("Generating 30+ high-dimensional features..."):
                 df_with_features = add_advanced_features(historical_data)
             if not df_with_features.empty:
                 st.session_state["ml_data"] = df_with_features
@@ -351,6 +374,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
         
         # --- Data Prep ---
         ml_data_processed = ml_data.copy()
+        # Target is the price N periods into the future
         ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
         ml_data_processed.dropna(subset=['target'], inplace=True)
         
@@ -363,7 +387,11 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 "Linear Regression (Baseline)": LinearRegression()
             }
             model_type_selected = st.selectbox("Select ML Model", list(model_options.keys()), key="ml_model_type_selector")
-            selected_features = st.multiselect("Select Features for Model", options=features, default=[f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close_1', 'VWAP', 'ATR', 'sin_day'))], key="ml_selected_features_multiselect")
+            
+            default_features = [f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close_1', 'VWAP', 'ATR', 'sin_day'))]
+            if not default_features: default_features = features[:10] # Fallback
+            
+            selected_features = st.multiselect("Select Features for Model", options=features, default=default_features, key="ml_selected_features_multiselect")
             
             if not selected_features:
                 st.warning("Please select at least one feature.")
@@ -376,8 +404,14 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 st.error("Insufficient clean data for robust training (need at least 100 samples).")
                 return
 
+            # Time Series Split (No Shuffle)
+            train_size = int(len(X) * (1 - test_size))
+            X_train_raw = X.iloc[:train_size]
+            X_test_raw = X.iloc[train_size:]
+            y_train = y.iloc[:train_size]
+            y_test = y.iloc[train_size:]
+            
             scaler = MinMaxScaler()
-            X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, shuffle=False)
             X_train_scaled = scaler.fit_transform(X_train_raw)
             X_test_scaled = scaler.transform(X_test_raw)
             
@@ -394,7 +428,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 st.session_state["ml_features"] = selected_features
                 st.session_state["ml_model_type"] = model_type_selected
                 st.session_state["prediction_horizon"] = current_prediction_horizon 
-                st.session_state["X_train_raw"] = X_train_raw # Keep raw features for importance plotting later
+                st.session_state["X_train_raw"] = X_train_raw 
                 st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon} periods!")
         
         with col_ml_output:
@@ -403,9 +437,23 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 rmse = np.sqrt(mse)
                 r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
                 
+                # Accuracy based on direction prediction
+                actual_direction = np.sign(st.session_state['y_test'].diff().dropna())
+                predicted_direction = np.sign(pd.Series(st.session_state['y_pred']).diff().dropna())
+                
+                if not actual_direction.empty and not predicted_direction.empty:
+                    # Align indices/length for comparison
+                    min_len = min(len(actual_direction), len(predicted_direction))
+                    directional_accuracy = (actual_direction.iloc[:min_len] == predicted_direction.iloc[:min_len]).mean() * 100
+                else:
+                    directional_accuracy = 0
+
                 st.markdown(f"##### Evaluation Metrics ({st.session_state['prediction_horizon']} periods ahead)")
+                col_m_r, col_m_a = st.columns(2)
+                col_m_r.metric("R2 Score (Variance Explained)", f"{r2:.4f}", help="Close to 1 is better.")
+                col_m_a.metric("Directional Accuracy (%)", f"{directional_accuracy:.2f}%", help="Percentage of correct UP/DOWN predictions.")
                 st.metric("Root Mean Squared Error (RMSE)", f"₹{rmse:.2f}")
-                st.metric("R2 Score (Precision Metric)", f"{r2:.4f}")
+
                 
                 pred_df = pd.DataFrame({'Actual': st.session_state['y_test'], 'Predicted': st.session_state['y_pred']}, index=st.session_state['y_test'].index)
                 
@@ -427,6 +475,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 features_list = st.session_state["ml_features"]
                 horizon = st.session_state["prediction_horizon"]
                 
+                # 1. Get the absolute latest cleaned features
                 latest_row = ml_data[features_list].iloc[[-1]] 
                 latest_row_scaled = scaler.transform(latest_row)
                 
@@ -446,9 +495,9 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                                          delta=f"{predicted_change:.2f}%")
                     
                     if predicted_change > 0.5:
-                        st.warning(f"**Action:** Strong potential BUY signal (+{predicted_change:.2f}%)")
+                        st.warning(f"**Action:** Strong potential BUY signal (Target: ₹{forecasted_price:.2f})")
                     elif predicted_change < -0.5:
-                        st.warning(f"**Action:** Strong potential SELL signal ({predicted_change:.2f}%)")
+                        st.warning(f"**Action:** Strong potential SELL signal (Target: ₹{forecasted_price:.2f})")
                     else:
                         st.info("**Action:** Neutral/Wait.")
             else:
@@ -473,6 +522,8 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
 
 def render_risk_portfolio_tab(kite_client: KiteConnect | None):
     st.header("3. Risk & Portfolio Analytics (VaR, Stress Testing)")
+    st.markdown("Quantify downside risk using Value at Risk (VaR) based on historical data.")
+    
     if not kite_client:
         st.info("Login first to analyze risk.")
         return
@@ -484,9 +535,10 @@ def render_risk_portfolio_tab(kite_client: KiteConnect | None):
         st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
         return
     
+    # Calculate daily returns in percentage
     daily_returns = historical_data['close'].pct_change().dropna() * 100
-    if daily_returns.empty:
-        st.error("Not enough valid data for risk analysis.")
+    if daily_returns.empty or len(daily_returns) < 50:
+        st.error("Not enough valid data for robust risk analysis (need > 50 periods).")
         return
 
     st.subheader(f"Value at Risk (VaR) Calculation for {last_symbol}")
@@ -494,21 +546,29 @@ def render_risk_portfolio_tab(kite_client: KiteConnect | None):
     
     with col_var_controls:
         confidence_level = st.slider("Confidence Level (%)", 90, 99, 99, step=1, key="risk_confidence_level")
-        holding_period_var = st.number_input("Holding Period for VaR (days)", min_value=1, value=1, step=1, key="risk_holding_period_var")
+        holding_period_var = st.number_input("Holding Period for VaR (days)", min_value=1, value=5, step=1, key="risk_holding_period_var")
         
-        var_percentile_1day = np.percentile(daily_returns, 100 - confidence_level)
+        # Historical VaR Calculation
+        # The percentile gives the worst loss observed at that confidence level (e.g., 1% percentile for 99% confidence)
+        var_percentile_1day = np.percentile(daily_returns, 100 - confidence_level) 
+        
+        # Scaling VaR for multi-day periods (square root rule)
         var_percentile_multiday = var_percentile_1day * np.sqrt(holding_period_var)
         
         current_price = historical_data['close'].iloc[-1]
         
-        st.markdown(f"Max potential loss over **{holding_period_var} day(s)** with **{confidence_level}% confidence:**")
+        st.markdown(f"Max potential loss over **{holding_period_var} day(s)** with **{confidence_level}% confidence (1 in {100 / (100 - confidence_level):.0f} chance):**")
         st.metric(f"VaR (Max Loss %)", f"{abs(var_percentile_multiday):.2f}%")
         st.metric(f"Potential Loss (₹ based on ₹{current_price:.2f})", f"₹{(abs(var_percentile_multiday) / 100) * current_price:,.2f}")
     
     with col_var_metrics:
-        fig_var = go.Figure(go.Histogram(x=daily_returns, nbinsx=50, name='Daily Returns'))
-        fig_var.add_vline(x=var_percentile_1day, line_dash="dash", line_color="red", annotation_text=f"1-Day VaR {confidence_level}%: {var_percentile_1day:.2f}%")
-        fig_var.update_layout(title_text=f'Daily Returns Distribution with {confidence_level}% VaR', height=400)
+        fig_var = go.Figure(go.Histogram(x=daily_returns, nbinsx=50, name='Daily Returns', marker_color='#007bff'))
+        
+        # Add the 1-day VaR line
+        fig_var.add_vline(x=var_percentile_1day, line_dash="dash", line_color="red", line_width=2, 
+                          annotation_text=f"1-Day VaR ({var_percentile_1day:.2f}%)", annotation_position="top left")
+        
+        fig_var.update_layout(title_text=f'Daily Returns Distribution with 1-Day VaR', height=400, template="plotly_white")
         st.plotly_chart(fig_var, use_container_width=True)
 
 def render_backtester_tab(kite_client: KiteConnect | None):
@@ -522,13 +582,14 @@ def render_backtester_tab(kite_client: KiteConnect | None):
         st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
         return
 
-    st.subheader(f"Strategy: Dual Moving Average Crossover for {last_symbol}")
+    st.subheader(f"Strategy: Dual Moving Average Crossover for {last_symbol} (High Speed Simulation)")
     df_backtest = historical_data.copy()
     
     col_bt_params, col_bt_run = st.columns(2)
     with col_bt_params:
         short_ma = st.slider("Short MA Window", 5, 30, 10, key="bt_short_ma")
         long_ma = st.slider("Long MA Window", 30, 100, 50, key="bt_long_ma")
+        initial_capital = st.number_input("Initial Capital (₹)", min_value=10000, value=100000, step=10000)
     
     with col_bt_run:
         if st.button("Run High-Speed Backtest", key="run_backtest_btn"):
@@ -536,7 +597,7 @@ def render_backtester_tab(kite_client: KiteConnect | None):
                 st.error("Not enough data for the selected long MA window.")
                 return
             
-            with st.spinner("Calculating strategy performance..."):
+            with st.spinner("Calculating strategy performance & professional metrics..."):
                 df_backtest['Short_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=short_ma)
                 df_backtest['Long_MA'] = ta.trend.sma_indicator(df_backtest['close'], window=long_ma)
                 
@@ -549,34 +610,42 @@ def render_backtester_tab(kite_client: KiteConnect | None):
                 df_backtest['Strategy_Return'] = df_backtest['Daily_Return'] * df_backtest['Position']
                 
                 # Calculate cumulative returns
-                df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return']).cumprod()
-                df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return']).cumprod()
+                df_backtest['Cumulative_Strategy_Return'] = (1 + df_backtest['Strategy_Return'].fillna(0)).cumprod()
+                df_backtest['Cumulative_Buy_Hold_Return'] = (1 + df_backtest['Daily_Return'].fillna(0)).cumprod()
                 
                 st.session_state['backtest_results'] = df_backtest
                 st.session_state['bt_metrics'] = calculate_performance_metrics(df_backtest['Strategy_Return'].dropna() * 100)
                 st.session_state['bh_metrics'] = calculate_performance_metrics(df_backtest['Daily_Return'].dropna() * 100)
-                st.success("Backtest completed.")
+                st.session_state['initial_capital'] = initial_capital
+                st.success("Backtest completed. Check performance metrics below.")
 
     if st.session_state.get('backtest_results') is not None:
         df_results = st.session_state['backtest_results']
         bt_metrics = st.session_state['bt_metrics']
         bh_metrics = st.session_state['bh_metrics']
+        initial_capital = st.session_state['initial_capital']
 
-        st.markdown("##### Strategy vs. Buy & Hold Comparison")
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
-            st.metric("Strategy Total Return", f"{bt_metrics.get('Total Return (%)', 0):.2f}%")
-            st.metric("Strategy Sharpe Ratio", f"{bt_metrics.get('Sharpe Ratio', 0):.2f}")
-            st.metric("Strategy Max Drawdown", f"{bt_metrics.get('Max Drawdown (%)', 0):.2f}%")
-        with col_m2:
-            st.metric("Buy & Hold Total Return", f"{bh_metrics.get('Total Return (%)', 0):.2f}%")
-            st.metric("Buy & Hold Sharpe Ratio", f"{bh_metrics.get('Sharpe Ratio', 0):.2f}")
-            st.metric("Buy & Hold Max Drawdown", f"{bh_metrics.get('Max Drawdown (%)', 0):.2f}%")
+        st.markdown("##### Strategy vs. Buy & Hold Professional Metrics")
+        
+        final_strategy_value = initial_capital * (1 + (bt_metrics.get('Total Return (%)', 0) / 100))
+        final_bh_value = initial_capital * (1 + (bh_metrics.get('Total Return (%)', 0) / 100))
 
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Strategy Total Return", f"{bt_metrics.get('Total Return (%)', 0):.2f}%", delta=f"Final Value: ₹{final_strategy_value:,.2f}")
+        col_m2.metric("Strategy Sharpe Ratio", f"{bt_metrics.get('Sharpe Ratio', 0):.2f}")
+        col_m3.metric("Strategy Max Drawdown", f"{bt_metrics.get('Max Drawdown (%)', 0):.2f}%")
+        
+        st.markdown("---")
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+        col_b1.metric("Buy & Hold Total Return", f"{bh_metrics.get('Total Return (%)', 0):.2f}%", delta=f"Final Value: ₹{final_bh_value:,.2f}")
+        col_b2.metric("Buy & Hold Sharpe Ratio", f"{bh_metrics.get('Sharpe Ratio', 0):.2f}")
+        col_b3.metric("Buy & Hold Max Drawdown", f"{bh_metrics.get('Max Drawdown (%)', 0):.2f}%")
+        
         fig_backtest = go.Figure()
-        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Strategy_Return'] * 100 - 100, name='Strategy Return (%)'))
-        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Buy_Hold_Return'] * 100 - 100, name='Buy & Hold (%)', line=dict(dash='dash')))
-        fig_backtest.update_layout(title_text=f"Cumulative Returns Comparison", height=500, template="plotly_white")
+        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Strategy_Return'] * 100 - 100, name='Strategy Return (%)', line=dict(color='green', width=2)))
+        fig_backtest.add_trace(go.Scatter(x=df_results.index, y=df_results['Cumulative_Buy_Hold_Return'] * 100 - 100, name='Buy & Hold (%)', line=dict(dash='dash', color='blue')))
+        fig_backtest.update_layout(title_text=f"Cumulative Returns Comparison (Initial Capital: ₹{initial_capital:,.0f})", height=500, template="plotly_white", yaxis_title="Cumulative Return (%)")
         st.plotly_chart(fig_backtest, use_container_width=True)
 
 
@@ -597,3 +666,4 @@ with tab_market: render_market_historical_tab(k, api_key, access_token)
 with tab_ml: render_price_predictor_tab(k, api_key, access_token)
 with tab_risk: render_risk_portfolio_tab(k)
 with tab_backtester: render_backtester_tab(k)
+```
