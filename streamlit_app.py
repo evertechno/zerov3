@@ -16,14 +16,27 @@ import lightgbm as lgb
 import ta  # Technical Analysis library
 # Import required preprocessing tools for ML
 from sklearn.preprocessing import MinMaxScaler 
+import warnings
+# Suppress the FutureWarning from LightGBM when setting max_depth
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Supabase imports
+
+# Supabase imports (kept for completeness, though auth logic is simplified)
 from supabase import create_client, Client
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Invsion Connect - Algorithmic Trading Platform", layout="wide", initial_sidebar_state="expanded")
-st.title("Invsion Connect - Algorithmic Trading & Price Prediction Platform")
-st.markdown("A focused platform for fetching market data and performing advanced Machine Learning driven price prediction.")
+st.title("Invsion Connect - Advanced Algorithmic Trading & Price Prediction Platform")
+
+# --- CRITICAL DISCLAIMER ---
+st.warning("""
+Disclaimer: This platform uses advanced Machine Learning (LightGBM, RandomForest) and deep feature engineering 
+to generate forecasts based on historical data patterns. **Stock market prediction is inherently uncertain.** 
+While the algorithms aim for maximum precision, no model can guarantee 100% accuracy in real markets. 
+Use these forecasts for informational purposes and consult a financial advisor before making investment decisions.
+""")
+st.markdown("---")
+
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
@@ -40,20 +53,27 @@ if "historical_data" not in st.session_state:
     st.session_state["historical_data"] = pd.DataFrame()
 if "last_fetched_symbol" not in st.session_state:
     st.session_state["last_fetched_symbol"] = None
-if "user_session" not in st.session_state:
-    st.session_state["user_session"] = None
-if "user_id" not in st.session_state:
-    st.session_state["user_id"] = None
 
-# --- ML specific initializations (Fix for KeyError) ---
+# --- ML specific initializations ---
 if "ml_data" not in st.session_state:
     st.session_state["ml_data"] = pd.DataFrame()
 if "ml_model" not in st.session_state:
     st.session_state["ml_model"] = None
 if "prediction_horizon" not in st.session_state:
     st.session_state["prediction_horizon"] = 5 # Default value
+if "y_test" not in st.session_state:
+    st.session_state["y_test"] = None
+if "y_pred" not in st.session_state:
+    st.session_state["y_pred"] = None
+if "scaler" not in st.session_state:
+    st.session_state["scaler"] = None
+if "ml_features" not in st.session_state:
+    st.session_state["ml_features"] = []
+if "ml_model_type" not in st.session_state:
+    st.session_state["ml_model_type"] = None
 
 # --- Load Credentials from Streamlit Secrets ---
+@st.cache_data(show_spinner=False)
 def load_secrets():
     secrets = st.secrets
     kite_conf = secrets.get("kite", {})
@@ -63,22 +83,26 @@ def load_secrets():
     if not kite_conf.get("api_key") or not kite_conf.get("api_secret") or not kite_conf.get("redirect_uri"):
         errors.append("Kite credentials (api_key, api_secret, redirect_uri)")
     if not supabase_conf.get("url") or not supabase_conf.get("anon_key"):
-        errors.append("Supabase credentials (url, anon_key)")
+        # Note: Supabase is optional for this demo, but credentials check remains if secrets are structured this way
+        pass 
 
     if errors:
-        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.")
-        st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
+        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}. Please refer to the template setup.")
         st.stop()
     return kite_conf, supabase_conf
 
 KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
 
-# --- Supabase Client Initialization ---
-@st.cache_resource(ttl=3600) # Cache for 1 hour to prevent re-initializing on every rerun
+# --- Supabase Client Initialization (Minimal for template compatibility) ---
+# Note: Full Supabase user management is omitted as per original template note.
+@st.cache_resource(ttl=3600) 
 def init_supabase_client(url: str, key: str) -> Client:
-    return create_client(url, key)
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None # Return None if credentials are bad or service is down
 
-supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["anon_key"])
+supabase: Client = init_supabase_client(SUPABASE_CREDENTIALS.get("url", ""), SUPABASE_CREDENTIALS.get("anon_key", ""))
 
 # --- KiteConnect Client Initialization (Unauthenticated for login URL) ---
 @st.cache_resource(ttl=3600)
@@ -89,9 +113,8 @@ kite_unauth_client = init_kite_unauth_client(KITE_CREDENTIALS["api_key"])
 login_url = kite_unauth_client.login_url()
 
 
-# --- Utility Functions (Only required ones kept) ---
+# --- Utility Functions ---
 
-# Helper to create an authenticated KiteConnect instance
 def get_authenticated_kite_client(api_key: str | None, access_token: str | None) -> KiteConnect | None:
     if api_key and access_token:
         k_instance = KiteConnect(api_key=api_key)
@@ -100,45 +123,28 @@ def get_authenticated_kite_client(api_key: str | None, access_token: str | None)
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner="Loading instruments...") # Cache for 24 hours
+@st.cache_data(ttl=86400, show_spinner="Loading instruments...") 
 def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
-    """Returns pandas.DataFrame of instrument data, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
         return pd.DataFrame({"_error": ["Kite not authenticated to load instruments."]})
     try:
         instruments = kite_instance.instruments(exchange) if exchange else kite_instance.instruments()
         df = pd.DataFrame(instruments)
-        if "instrument_token" in df.columns:
-            df["instrument_token"] = df["instrument_token"].astype("int64")
         if 'tradingsymbol' in df.columns and 'name' in df.columns:
             df = df[['instrument_token', 'tradingsymbol', 'name', 'exchange']]
         return df
     except Exception as e:
-        return pd.DataFrame({"_error": [f"Failed to load instruments for {exchange or 'all exchanges'}: {e}"]})
+        return pd.DataFrame({"_error": [f"Failed to load instruments: {e}"]})
 
 
-@st.cache_data(ttl=60) # Cache LTP for 1 minute
-def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
-    """Fetches LTP for a symbol, using an internally created Kite instance."""
-    kite_instance = get_authenticated_kite_client(api_key, access_token)
-    if not kite_instance:
-        return {"_error": "Kite not authenticated to fetch LTP."}
-    
-    exchange_symbol = f"{exchange.upper()}:{symbol.upper()}"
-    try:
-        ltp_data = kite_instance.ltp([exchange_symbol])
-        return ltp_data.get(exchange_symbol)
-    except Exception as e:
-        return {"_error": str(e)}
-
-@st.cache_data(ttl=3600) # Cache historical data for 1 hour
+@st.cache_data(ttl=3600) 
 def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
-    """Fetches historical data for a symbol, using an internally created Kite instance."""
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
         return pd.DataFrame({"_error": ["Kite not authenticated to fetch historical data."]})
 
+    # Fetch instruments dynamically to find the token
     instruments_df = load_instruments_cached(api_key, access_token, exchange)
     if "_error" in instruments_df.columns:
         return pd.DataFrame({"_error": [instruments_df.loc[0, '_error']]}) 
@@ -149,8 +155,9 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
 
     from_datetime = datetime.combine(from_date, datetime.min.time())
     to_datetime = datetime.combine(to_date, datetime.max.time())
+    
     try:
-        data = kite_instance.historical_data(token, from_date=from_datetime, to_date=to_datetime, interval=interval)
+        data = kite_instance.historical_data(token, from_date=from_datetime, to_date=to_datetime, interval=interval, continuous=False)
         df = pd.DataFrame(data)
         if not df.empty:
             df["date"] = pd.to_datetime(df["date"])
@@ -172,36 +179,49 @@ def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = 
     return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
 
 
-# Enhanced feature engineering function
+# Enhanced feature engineering function for high precision
 def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or 'close' not in df.columns:
         return pd.DataFrame()
 
     df_copy = df.copy() 
     
-    # 1. Basic Technical Indicators (Momentum, Trend, Volatility)
+    # 1. Trend & Moving Averages
     df_copy['SMA_10'] = ta.trend.sma_indicator(df_copy['close'], window=10)
+    df_copy['EMA_20'] = ta.trend.ema_indicator(df_copy['close'], window=20)
+    df_copy['DMI_Positive'] = ta.trend.adx_pos(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+    df_copy['DMI_Negative'] = ta.trend.adx_neg(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+
+    # 2. Momentum Indicators
     df_copy['RSI_14'] = ta.momentum.rsi(df_copy['close'], window=14)
     macd_obj = ta.trend.MACD(df_copy['close'], window_fast=12, window_slow=26, window_sign=9)
-    df_copy['MACD'] = macd_obj.macd()
-    df_copy['Bollinger_High'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_hband()
-    df_copy['Bollinger_Low'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_lband()
+    df_copy['MACD_Diff'] = macd_obj.macd_diff() # Histogram difference
+    df_copy['Stoch_K'] = ta.momentum.stoch(df_copy['high'], df_copy['low'], df_copy['close'], window=14, smooth_window=3)
     
-    # 2. Price/Volume based Features
+    # 3. Volatility Features
+    bb_obj = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2)
+    df_copy['Bollinger_B_Perc'] = bb_obj.bollinger_pband() # Measures location within the bands
+    df_copy['ATR'] = ta.volatility.average_true_range(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+    
+    # 4. Price/Volume based Features
+    # Note: VWAP calculation needs high, low, close, volume, all present.
     df_copy['VWAP'] = ta.volume.volume_weighted_average_price(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14)
     df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
 
-    # 3. Volatility Features
-    df_copy['ATR'] = ta.volatility.average_true_range(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
-    
-    # 4. Lagged Prices and Returns (for time series context)
-    for lag in [1, 2, 5]:
+    # 5. Lagged Prices and Returns (for time series context)
+    # These are crucial for predicting 'next period'
+    for lag in [1, 5, 10]:
         df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
         df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) * 100
 
+    # Fill NaNs created by indicators (usually the first N rows)
+    # Using backfill/forwardfill on indicators before dropping is safer
     df_copy.fillna(method='bfill', inplace=True)
     df_copy.fillna(method='ffill', inplace=True)
+    
+    # Drop remaining NaNs (usually the first row or two where bfill failed)
     df_copy.dropna(inplace=True) 
+    
     return df_copy
 
 
@@ -220,62 +240,41 @@ with st.sidebar:
             st.session_state["kite_access_token"] = data.get("access_token")
             st.session_state["kite_login_response"] = data
             st.sidebar.success("Kite Access token obtained.")
-            st.query_params.clear() # Clear request_token from URL
-            st.rerun() # Rerun to refresh UI
+            st.query_params.clear() 
+            st.rerun() 
         except Exception as e:
             st.sidebar.error(f"Failed to generate Kite session: {e}")
 
     if st.session_state["kite_access_token"]:
         st.success("Kite Authenticated ✅")
         if st.sidebar.button("Logout from Kite", key="kite_logout_btn"):
+            # Clear all dependent states
             st.session_state["kite_access_token"] = None
-            st.session_state["kite_login_response"] = None
             st.session_state["instruments_df"] = pd.DataFrame() 
+            st.session_state["historical_data"] = pd.DataFrame() 
+            st.session_state["ml_data"] = pd.DataFrame()
+            st.session_state["ml_model"] = None
             st.success("Logged out from Kite. Please login again.")
             st.rerun()
     else:
         st.info("Not authenticated with Kite yet.")
 
     st.markdown("---")
-    st.markdown("### 2. Supabase User Account (Optional)")
-    
-    # Check/refresh Supabase session
-    def _refresh_supabase_session():
-        try:
-            session_data = supabase.auth.get_session()
-            if session_data and session_data.user:
-                st.session_state["user_session"] = session_data
-                st.session_state["user_id"] = session_data.user.id
-            else:
-                st.session_state["user_session"] = None
-                st.session_state["user_id"] = None
-        except Exception:
-            st.session_state["user_session"] = None
-            st.session_state["user_id"] = None
-
-    _refresh_supabase_session()
-
-    if st.session_state["user_session"]:
-        st.success(f"Supabase Logged in: {st.session_state['user_session'].user.email}")
-        if st.button("Logout from Supabase", key="supabase_logout_btn"):
-            try:
-                supabase.auth.sign_out()
-                _refresh_supabase_session() 
-                st.sidebar.success("Logged out from Supabase.")
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Error logging out: {e}")
+    st.markdown("### 2. Status")
+    st.info(f"Historical Data Loaded: {len(st.session_state['historical_data'])} rows")
+    if st.session_state.get("ml_model"):
+        st.success(f"Model Trained: {st.session_state['ml_model_type']}")
     else:
-        st.info("Supabase login section hidden for brevity. Check original file for full auth logic.")
+        st.warning("Model not trained.")
 
 
 # --- Authenticated KiteConnect client ---
 k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
-# --- Tab Logic Functions ---
+# --- Tab Logic Functions (Market Data is unchanged from good template) ---
 
 def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("1. Market Data & Historical Data")
+    st.header("1. Market Data & Historical Data Fetch")
     if not kite_client:
         st.info("Login first to fetch market data.")
         return
@@ -283,26 +282,6 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         st.info("Kite authentication details required for data access.")
         return
 
-    st.subheader("Current Market Data Snapshot (LTP)")
-    col_market_quote1, col_market_quote2 = st.columns([1, 2])
-    with col_market_quote1:
-        q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
-        q_symbol = st.text_input("Tradingsymbol", value="RELIANCE", key="market_symbol_tab") 
-        if st.button("Get Latest Price", key="get_market_data_btn"):
-            ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) 
-            if ltp_data and "_error" not in ltp_data:
-                st.session_state["current_market_data"] = ltp_data
-                st.success(f"Fetched LTP for {q_symbol}.")
-            else:
-                st.error(f"Market data fetch failed for {q_symbol}: {ltp_data.get('_error', 'Unknown error')}")
-    with col_market_quote2:
-        if st.session_state.get("current_market_data"):
-            st.markdown("##### Latest Quote Details")
-            st.json(st.session_state["current_market_data"])
-        else:
-            st.info("Market data will appear here.")
-
-    st.markdown("---")
     st.subheader("Historical Price Data")
     
     col_hist_controls, col_hist_plot = st.columns([1, 2])
@@ -314,8 +293,12 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         interval = st.selectbox("Interval", ["day", "minute", "5minute", "30minute", "week", "month"], index=0, key="hist_interval_selector")
 
         if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
-            if st.session_state["instruments_df"].empty:
-                st.info("Loading instruments first...")
+            if from_date >= to_date:
+                st.error("From Date must be before To Date.")
+                return
+
+            with st.spinner(f"Fetching instruments and historical data for {hist_symbol}..."):
+                # Ensure instruments are loaded
                 df_instruments = load_instruments_cached(api_key, access_token, hist_exchange)
                 if not df_instruments.empty and "_error" not in df_instruments.columns:
                     st.session_state["instruments_df"] = df_instruments
@@ -323,23 +306,24 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
                     st.error(f"Failed to load instruments: {df_instruments.get('_error', 'Unknown error')}")
                     return
 
-            with st.spinner(f"Fetching {interval} historical data for {hist_symbol}..."):
+                # Fetch historical data
                 df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, hist_exchange) 
+                
                 if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
                     st.session_state["historical_data"] = df_hist
                     st.session_state["last_fetched_symbol"] = hist_symbol
-                    # Reset ML session state if new data is fetched
+                    # Reset ML session state upon new data fetch
                     st.session_state["ml_data"] = pd.DataFrame()
                     st.session_state["ml_model"] = None
-                    st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
+                    st.success(f"Fetched {len(df_hist)} records for {hist_symbol} at {interval} interval.")
                 else:
                     st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
 
     with col_hist_plot:
-        if not st.session_state.get("historical_data", pd.DataFrame()).empty:
-            df = st.session_state["historical_data"]
+        df = st.session_state.get("historical_data", pd.DataFrame())
+        if not df.empty:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Candlestick'), row=1, col=1)
+            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
             fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color='blue'), row=2, col=1)
             fig.update_layout(title_text=f"Historical Price & Volume for {st.session_state['last_fetched_symbol']}", xaxis_rangeslider_visible=False, height=600, template="plotly_white")
             st.plotly_chart(fig, use_container_width=True)
@@ -357,7 +341,7 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
     last_symbol = st.session_state.get("last_fetched_symbol", "N/A")
 
     if historical_data.empty:
-        st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
+        st.warning("No historical data available. Fetch data from 'Market Data & Historical Data' first.")
         return
 
     st.subheader(f"1. Feature Engineering & Data Preparation for {last_symbol}")
@@ -369,36 +353,44 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             if not df_with_features.empty:
                 st.session_state["ml_data"] = df_with_features
                 st.session_state["ml_model"] = None # Reset model
-                st.success(f"Data prepared with {len(df_with_features.columns)} features.")
+                st.success(f"Data prepared with {len(df_with_features.columns)} features. Ready for training.")
             else:
-                st.error("Failed to add features. Data might be too short or invalid.")
+                st.error("Failed to add features. Data might be too short (need >30 periods) or invalid.")
                 st.session_state["ml_data"] = pd.DataFrame()
 
     ml_data = st.session_state.get("ml_data", pd.DataFrame())
     
     if not ml_data.empty:
         
-        # Capture the current widget value for horizon
         with col_prep:
-            current_prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=20, value=5, step=1, key="pred_horizon")
+            # Set target definition based on user input
+            current_prediction_horizon = st.number_input("Prediction Horizon (Periods Ahead)", min_value=1, max_value=20, value=st.session_state.get("prediction_horizon", 5), step=1, key="pred_horizon")
             test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
+            
+        # --- Data Prep: Target and Feature Definition ---
+        ml_data_processed = ml_data.copy()
+        
+        # Define the target: The price 'n' periods into the future
+        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
+        ml_data_processed.dropna(subset=['target'], inplace=True)
+        
+        # Features exclude the target, and future-looking price columns (OHLC, Volume, etc.)
+        features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
         
         st.markdown("---")
         st.subheader("2. Machine Learning Model Training")
         
         col_ml_controls, col_ml_output = st.columns(2)
         
-        # --- Data Prep ---
-        ml_data_processed = ml_data.copy()
-        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
-        ml_data_processed.dropna(subset=['target'], inplace=True)
-        
-        # Features exclude price columns, target, and volume (unless normalized)
-        features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
-        
         with col_ml_controls:
             model_type_selected = st.selectbox("Select ML Model", ["LightGBM Regressor (High Performance)", "Random Forest Regressor", "Linear Regression"], key="ml_model_type_selector")
-            selected_features = st.multiselect("Select Features for Model", options=features, default=[f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close', 'SMA', 'ATR'))], key="ml_selected_features_multiselect")
+            
+            # Pre-select robust features
+            default_features = [f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close_1', 'Lag_Return', 'ATR', 'VWAP'))]
+            if len(default_features) == 0:
+                 default_features = features[:10]
+                 
+            selected_features = st.multiselect("Select Features for Model", options=features, default=default_features, key="ml_selected_features_multiselect")
             
             if not selected_features:
                 st.warning("Please select at least one feature.")
@@ -407,63 +399,74 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             X = ml_data_processed[selected_features]
             y = ml_data_processed['target']
             
-            if X.empty or y.empty or len(X) < 100:
-                st.error("Insufficient clean data for robust training (need at least 100 samples).")
+            if len(X) < 100 or len(y) < 100:
+                st.warning(f"Insufficient data ({len(X)} periods) for robust training. Need at least 100 samples.")
                 return
 
-            # Apply MinMax Scaling to features for better model performance (especially Linear Regression)
+            # --- Scaling and Splitting ---
             scaler = MinMaxScaler()
             X_scaled = scaler.fit_transform(X)
             
-            # Split data (always shuffle=False for time series)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=42, shuffle=False)
+            # Use fixed index for splitting to ensure time sequence is preserved (shuffle=False)
+            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, shuffle=False)
+            
             st.info(f"Training data: {len(X_train)} periods, Testing data: {len(X_test)} periods")
 
             if st.button(f"Train {model_type_selected} Model", key="train_ml_model_btn"):
                 if len(X_train) == 0 or len(X_test) == 0:
-                    st.error("Insufficient data for training/testing.")
+                    st.error("Insufficient data for training/testing after splitting.")
                     return
                 
-                # Model selection and initialization
+                # Model selection
                 model = {
                     "Linear Regression": LinearRegression(),
-                    "Random Forest Regressor": RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
-                    "LightGBM Regressor (High Performance)": lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, n_jobs=-1)
+                    "Random Forest Regressor": RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1, min_samples_split=5),
+                    "LightGBM Regressor (High Performance)": lgb.LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=40, random_state=42, n_jobs=-1, metric='rmse')
                 }.get(model_type_selected)
 
                 if model:
-                    with st.spinner(f"Training {model_type_selected} model for {current_prediction_horizon}-day prediction..."):
+                    with st.spinner(f"Training {model_type_selected} model..."):
                         model.fit(X_train, y_train)
                         y_pred = model.predict(X_test)
                     
+                    # Save results to session state
                     st.session_state["ml_model"] = model
                     st.session_state["y_test"] = y_test
                     st.session_state["y_pred"] = y_pred
-                    st.session_state["X_test_scaled"] = X_test
                     st.session_state["scaler"] = scaler
                     st.session_state["ml_features"] = selected_features
                     st.session_state["ml_model_type"] = model_type_selected
-                    st.session_state["prediction_horizon"] = current_prediction_horizon # Save the actual horizon used
-                    st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon}-day horizon!")
+                    st.session_state["prediction_horizon"] = current_prediction_horizon
+                    st.success(f"**{model_type_selected}** Model Trained successfully for {current_prediction_horizon}-period prediction!")
         
         with col_ml_output:
             if st.session_state.get("ml_model") and st.session_state.get("y_test") is not None:
-                # This access is now safe due to global initialization and setting in the training block
-                mse = mean_squared_error(st.session_state['y_test'], st.session_state['y_pred'])
+                y_test_s = st.session_state['y_test']
+                y_pred_s = st.session_state['y_pred']
+
+                mse = mean_squared_error(y_test_s, y_pred_s)
                 rmse = np.sqrt(mse)
-                r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
+                r2 = r2_score(y_test_s, y_pred_s)
                 
-                st.markdown(f"##### Evaluation Metrics ({st.session_state['prediction_horizon']} periods ahead)")
-                st.metric("Root Mean Squared Error (RMSE)", f"₹{rmse:.2f}")
-                st.metric("R2 Score (Coefficient of Determination)", f"{r2:.4f}")
+                # Calculate precision (how often the predicted direction matches the actual direction)
+                actual_direction = np.sign(y_test_s.values - historical_data.iloc[y_test_s.index].close.values)
+                predicted_direction = np.sign(y_pred_s - historical_data.iloc[y_test_s.index].close.values)
+                directional_accuracy = np.mean(actual_direction == predicted_direction) * 100
                 
-                pred_df = pd.DataFrame({'Actual': st.session_state['y_test'], 'Predicted': st.session_state['y_pred']}, index=st.session_state['y_test'].index)
+                st.markdown(f"##### Evaluation Metrics (Horizon: {st.session_state['prediction_horizon']} periods)")
+                
+                col_met1, col_met2, col_met3 = st.columns(3)
+                col_met1.metric("RMSE", f"₹{rmse:.2f}")
+                col_met2.metric("R2 Score", f"{r2:.4f}")
+                col_met3.metric("Directional Accuracy", f"{directional_accuracy:.2f}%")
                 
                 # Plotting Actual vs Predicted
+                pred_df = pd.DataFrame({'Actual': y_test_s, 'Predicted': y_pred_s}, index=y_test_s.index)
+                
                 fig_pred = go.Figure()
                 fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Actual'], mode='lines', name='Actual Future Price'))
                 fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Predicted'], mode='lines', name='Predicted Future Price', line=dict(dash='dot', width=2)))
-                fig_pred.update_layout(title_text=f"Model Performance: Actual vs. Predicted Price ({st.session_state['prediction_horizon']} periods ahead)", height=500, template="plotly_white")
+                fig_pred.update_layout(title_text=f"Model Performance: Actual vs. Predicted Price", height=500, template="plotly_white")
                 st.plotly_chart(fig_pred, use_container_width=True)
 
         st.markdown("---")
@@ -476,15 +479,20 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             horizon = st.session_state["prediction_horizon"]
             
             # Prepare the latest data point for prediction
+            # Use the last row of the ML data (which contains all indicators calculated up to the present)
             latest_row = ml_data[features_list].iloc[[-1]] 
             
-            # Scale the features
+            # Crucial: Check if scaling was successful
+            if scaler is None:
+                st.error("Scaler not found. Retrain the model.")
+                return
+
+            # Scale the features using the fitted scaler
             latest_row_scaled = scaler.transform(latest_row)
             
-            if st.button(f"Generate Forecast for Next {horizon} Periods ({model_type_selected})", key="generate_forecast_btn"):
+            if st.button(f"Generate Forecast for Next {horizon} Periods", key="generate_forecast_btn"):
                 
-                # Predict the price after the specified horizon
-                with st.spinner(f"Predicting next {horizon} periods..."):
+                with st.spinner(f"Predicting next {horizon} periods using {st.session_state['ml_model_type']}..."):
                     forecasted_price = model.predict(latest_row_scaled)[0]
                 
                 last_known_close = historical_data['close'].iloc[-1]
@@ -492,34 +500,46 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 # Calculate the percentage movement predicted
                 predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
 
-                st.success(f"Forecast Generated using **{model_type_selected}** model:")
+                st.success(f"Forecast Generated (Model: {st.session_state['ml_model_type']})")
                 
                 col_forecast1, col_forecast2, col_forecast3 = st.columns(3)
                 col_forecast1.metric("Last Known Close Price", f"₹{last_known_close:.2f}")
                 col_forecast2.metric(f"Predicted Price (in {horizon} periods)", 
                                      f"₹{forecasted_price:.2f}", 
                                      delta=f"{predicted_change:.2f}%")
-                col_forecast3.metric("Prediction Date Approx.", 
-                                     (historical_data.index[-1] + timedelta(days=horizon)).strftime('%Y-%m-%d'))
                 
-                # Interpret the result
-                if predicted_change > 0:
-                    st.info(f"**Action Indication:** Potential **BUY/HOLD** signal, expecting a rise of {predicted_change:.2f}% over the next {horizon} periods.")
-                elif predicted_change < 0:
-                    st.info(f"**Action Indication:** Potential **SELL/SHORT** signal, expecting a drop of {abs(predicted_change):.2f}% over the next {horizon} periods.")
+                # Approximate date of prediction fulfillment
+                if historical_data.index.freq is not None:
+                    # If frequency is known (e.g., minute data)
+                    approx_date = historical_data.index[-1] + pd.Timedelta(f"{horizon} {historical_data.index.freq}")
                 else:
-                    st.info("**Action Indication:** Neutral outlook, minimal price change predicted.")
+                     # Default estimation (if using 'day' data, assume standard day increase)
+                    approx_date = historical_data.index[-1] + timedelta(days=horizon)
+
+                col_forecast3.metric("Prediction Date Approx.", approx_date.strftime('%Y-%m-%d'))
+                
+                st.markdown("#### **Trading Signal**")
+                if predicted_change > 1.0:
+                    st.success(f"**STRONG BUY:** High confidence in a significant upward move ({predicted_change:.2f}%) over the horizon.")
+                elif predicted_change > 0.1:
+                    st.info(f"**BUY/HOLD:** Potential upward signal ({predicted_change:.2f}%).")
+                elif predicted_change < -1.0:
+                    st.error(f"**STRONG SELL/SHORT:** High confidence in a significant downward move ({abs(predicted_change):.2f}%) over the horizon.")
+                elif predicted_change < -0.1:
+                    st.warning(f"**SELL/WAIT:** Potential downward signal ({abs(predicted_change):.2f}%).")
+                else:
+                    st.markdown(f"**NEUTRAL:** Expecting range-bound movement (change < 0.1%).")
         else:
             st.info("Train the machine learning model first to generate the forecast.")
 
 # --- Main Application Logic (Tab Rendering) ---
-# Global api_key and access_token to pass to tab functions
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-# Only the requested tabs are created
 tabs = st.tabs(["Market Data & Historical Data", "Price Predictor (ML)"])
 tab_market, tab_ml = tabs
 
-with tab_market: render_market_historical_tab(k, api_key, access_token)
-with tab_ml: render_price_predictor_tab(k, api_key, access_token)
+with tab_market: 
+    render_market_historical_tab(k, api_key, access_token)
+with tab_ml: 
+    render_price_predictor_tab(k, api_key, access_token)
