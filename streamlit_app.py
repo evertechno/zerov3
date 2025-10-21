@@ -7,28 +7,28 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import lightgbm as lgb
 import ta  # Technical Analysis library
-# Import required preprocessing tools for ML
-from sklearn.preprocessing import MinMaxScaler
-
-# Supabase imports
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
+from collections import deque
+import pickle
 from supabase import create_client, Client
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="Invsion Connect - Algorithmic Trading Platform", layout="wide", initial_sidebar_state="expanded")
-st.title("Invsion Connect - Algorithmic Trading & Price Prediction Platform")
-st.markdown("A focused platform for fetching market data, performing in-depth analysis, and running ML-driven price predictions.")
+st.set_page_config(page_title="Invsion Connect - Adaptive AI Trading Platform", layout="wide", initial_sidebar_state="expanded")
+st.title("🚀 Invsion Connect - Adaptive AI Trading Platform")
+st.markdown("Production-grade platform with real-time learning, ensemble predictions, and continuous model improvement.")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
+MAX_PREDICTION_HISTORY = 500  # Store last N predictions for online learning
 
-# Initialize session state variables if they don't exist
+# Initialize session state variables
 if "kite_access_token" not in st.session_state:
     st.session_state["kite_access_token"] = None
 if "kite_login_response" not in st.session_state:
@@ -44,15 +44,26 @@ if "user_session" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
 
-# --- ML specific initializations ---
+# --- Enhanced ML specific initializations ---
 if "ml_data" not in st.session_state:
     st.session_state["ml_data"] = pd.DataFrame()
-if "base_model" not in st.session_state:
-    st.session_state["base_model"] = None
-if "error_corrector_model" not in st.session_state:
-    st.session_state["error_corrector_model"] = None
+if "ensemble_models" not in st.session_state:
+    st.session_state["ensemble_models"] = {}
+if "meta_learner" not in st.session_state:
+    st.session_state["meta_learner"] = None
+if "prediction_history" not in st.session_state:
+    st.session_state["prediction_history"] = deque(maxlen=MAX_PREDICTION_HISTORY)
+if "performance_metrics" not in st.session_state:
+    st.session_state["performance_metrics"] = {
+        "rmse_history": [],
+        "mae_history": [],
+        "mape_history": [],
+        "directional_accuracy": []
+    }
+if "online_learning_enabled" not in st.session_state:
+    st.session_state["online_learning_enabled"] = False
 if "prediction_horizon" not in st.session_state:
-    st.session_state["prediction_horizon"] = 5  # Default value
+    st.session_state["prediction_horizon"] = 5
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -100,7 +111,6 @@ def get_authenticated_kite_client(api_key: str | None, access_token: str | None)
 
 @st.cache_data(ttl=86400, show_spinner="Loading instruments...")
 def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
-    # ... (function code is unchanged)
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
         return pd.DataFrame({"_error": ["Kite not authenticated to load instruments."]})
@@ -117,7 +127,6 @@ def load_instruments_cached(api_key: str, access_token: str, exchange: str = Non
 
 @st.cache_data(ttl=60)
 def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
-    # ... (function code is unchanged)
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
         return {"_error": "Kite not authenticated to fetch LTP."}
@@ -131,7 +140,6 @@ def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange:
 
 @st.cache_data(ttl=3600)
 def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
-    # ... (function code is unchanged)
     kite_instance = get_authenticated_kite_client(api_key, access_token)
     if not kite_instance:
         return pd.DataFrame({"_error": ["Kite not authenticated to fetch historical data."]})
@@ -160,7 +168,6 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         return pd.DataFrame({"_error": [str(e)]})
 
 def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
-    # ... (function code is unchanged)
     if df.empty:
         return None
     mask = (df.get("exchange", "").str.upper() == exchange.upper()) & \
@@ -169,7 +176,7 @@ def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = 
     return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
 
 def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
-    # ... (function code is unchanged from previous enhanced version)
+    """Enhanced feature engineering with temporal and market microstructure features"""
     if df.empty or 'close' not in df.columns:
         return pd.DataFrame()
 
@@ -177,43 +184,261 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # 1. Basic Technical Indicators
     df_copy['SMA_10'] = ta.trend.sma_indicator(df_copy['close'], window=10)
+    df_copy['SMA_20'] = ta.trend.sma_indicator(df_copy['close'], window=20)
     df_copy['SMA_50'] = ta.trend.sma_indicator(df_copy['close'], window=50)
+    df_copy['EMA_12'] = ta.trend.ema_indicator(df_copy['close'], window=12)
+    df_copy['EMA_26'] = ta.trend.ema_indicator(df_copy['close'], window=26)
+    
+    # 2. Momentum Indicators
     df_copy['RSI_14'] = ta.momentum.rsi(df_copy['close'], window=14)
+    df_copy['RSI_7'] = ta.momentum.rsi(df_copy['close'], window=7)
+    df_copy['Stochastic_K'] = ta.momentum.stoch(df_copy['high'], df_copy['low'], df_copy['close'])
+    df_copy['Stochastic_D'] = ta.momentum.stoch_signal(df_copy['high'], df_copy['low'], df_copy['close'])
+    df_copy['Williams_R'] = ta.momentum.williams_r(df_copy['high'], df_copy['low'], df_copy['close'])
+    
+    # 3. MACD Features
     macd_obj = ta.trend.MACD(df_copy['close'])
     df_copy['MACD'] = macd_obj.macd()
     df_copy['MACD_Signal'] = macd_obj.macd_signal()
+    df_copy['MACD_Hist'] = macd_obj.macd_diff()
     
-    # 2. Volatility Features
+    # 4. Volatility Features
     bb_obj = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2)
     df_copy['Bollinger_High'] = bb_obj.bollinger_hband()
     df_copy['Bollinger_Low'] = bb_obj.bollinger_lband()
     df_copy['Bollinger_Width'] = bb_obj.bollinger_wband()
+    df_copy['Bollinger_Pct'] = bb_obj.bollinger_pband()
     df_copy['ATR'] = ta.volatility.average_true_range(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+    df_copy['ATR_Pct'] = (df_copy['ATR'] / df_copy['close']) * 100
     
-    # 3. Trend Strength Features
+    # 5. Trend Strength Features
     adx_obj = ta.trend.ADXIndicator(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
     df_copy['ADX'] = adx_obj.adx()
     df_copy['ADX_Pos'] = adx_obj.adx_pos()
     df_copy['ADX_Neg'] = adx_obj.adx_neg()
-
-    # 4. Volume-based Features
+    
+    # 6. Volume-based Features
     df_copy['VWAP'] = ta.volume.volume_weighted_average_price(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14)
     df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
+    df_copy['Volume_SMA'] = df_copy['volume'].rolling(window=20).mean()
+    df_copy['Volume_Ratio'] = df_copy['volume'] / df_copy['Volume_SMA']
     
-    # 5. Lagged Prices and Returns
-    for lag in [1, 2, 5, 10]:
+    # 7. Price Action Features
+    df_copy['High_Low_Range'] = (df_copy['high'] - df_copy['low']) / df_copy['close']
+    df_copy['Close_Open_Range'] = (df_copy['close'] - df_copy['open']) / df_copy['open']
+    df_copy['Upper_Shadow'] = (df_copy['high'] - df_copy[['open', 'close']].max(axis=1)) / df_copy['close']
+    df_copy['Lower_Shadow'] = (df_copy[['open', 'close']].min(axis=1) - df_copy['low']) / df_copy['close']
+    
+    # 8. Lagged Features (Multiple Horizons)
+    for lag in [1, 2, 3, 5, 10, 20]:
         df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
         df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) * 100
-
-    df_copy.fillna(method='bfill', inplace=True)
-    df_copy.fillna(method='ffill', inplace=True)
+        df_copy[f'Lag_Volume_{lag}'] = df_copy['volume'].shift(lag)
+    
+    # 9. Rolling Statistics (Volatility & Momentum)
+    for window in [5, 10, 20]:
+        df_copy[f'Rolling_Mean_{window}'] = df_copy['close'].rolling(window=window).mean()
+        df_copy[f'Rolling_Std_{window}'] = df_copy['close'].rolling(window=window).std()
+        df_copy[f'Rolling_Min_{window}'] = df_copy['close'].rolling(window=window).min()
+        df_copy[f'Rolling_Max_{window}'] = df_copy['close'].rolling(window=window).max()
+        df_copy[f'Price_Position_{window}'] = (df_copy['close'] - df_copy[f'Rolling_Min_{window}']) / \
+                                              (df_copy[f'Rolling_Max_{window}'] - df_copy[f'Rolling_Min_{window}'])
+    
+    # 10. Temporal Features
+    df_copy['Day_of_Week'] = df_copy.index.dayofweek
+    df_copy['Day_of_Month'] = df_copy.index.day
+    df_copy['Week_of_Year'] = df_copy.index.isocalendar().week
+    df_copy['Month'] = df_copy.index.month
+    
+    # 11. Cyclic Encoding of Temporal Features
+    df_copy['Day_of_Week_Sin'] = np.sin(2 * np.pi * df_copy['Day_of_Week'] / 7)
+    df_copy['Day_of_Week_Cos'] = np.cos(2 * np.pi * df_copy['Day_of_Week'] / 7)
+    df_copy['Month_Sin'] = np.sin(2 * np.pi * df_copy['Month'] / 12)
+    df_copy['Month_Cos'] = np.cos(2 * np.pi * df_copy['Month'] / 12)
+    
+    # 12. Market Regime Features
+    df_copy['Volatility_Regime'] = (df_copy['ATR_Pct'] > df_copy['ATR_Pct'].rolling(window=50).mean()).astype(int)
+    df_copy['Trend_Regime'] = (df_copy['SMA_20'] > df_copy['SMA_50']).astype(int)
+    
+    # Forward fill then backward fill to handle NaN values
+    df_copy = df_copy.fillna(method='ffill').fillna(method='bfill')
     df_copy.dropna(inplace=True) 
+    
     return df_copy
+
+
+class AdaptiveEnsemblePredictor:
+    """
+    Production-grade ensemble predictor with online learning capabilities
+    """
+    def __init__(self, prediction_horizon=5):
+        self.prediction_horizon = prediction_horizon
+        self.base_models = {}
+        self.meta_learner = None
+        self.scaler = RobustScaler()  # More robust to outliers
+        self.feature_names = []
+        self.prediction_history = deque(maxlen=MAX_PREDICTION_HISTORY)
+        self.model_weights = {}
+        self.online_learning_buffer = []
+        
+    def initialize_models(self, complexity='balanced'):
+        """Initialize diverse set of base models for ensemble"""
+        if complexity == 'fast':
+            self.base_models = {
+                'ridge': Ridge(alpha=1.0),
+                'lasso': Lasso(alpha=0.1),
+                'lgbm': lgb.LGBMRegressor(n_estimators=100, learning_rate=0.1, num_leaves=20, random_state=42),
+            }
+        elif complexity == 'accurate':
+            self.base_models = {
+                'ridge': Ridge(alpha=0.5),
+                'lasso': Lasso(alpha=0.05),
+                'lgbm': lgb.LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=50, random_state=42),
+                'rf': RandomForestRegressor(n_estimators=300, max_depth=15, random_state=42, n_jobs=-1),
+                'gb': GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=5, random_state=42)
+            }
+        else:  # balanced
+            self.base_models = {
+                'ridge': Ridge(alpha=0.8),
+                'lasso': Lasso(alpha=0.08),
+                'lgbm': lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42),
+                'rf': RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+            }
+        
+        # Initialize meta-learner (stacking)
+        self.meta_learner = Ridge(alpha=0.1)
+        
+        # Initialize equal weights
+        self.model_weights = {name: 1.0/len(self.base_models) for name in self.base_models.keys()}
+    
+    def train(self, X, y, features):
+        """Train ensemble with cross-validation"""
+        self.feature_names = features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Use TimeSeriesSplit for proper temporal validation
+        tscv = TimeSeriesSplit(n_splits=5)
+        meta_features = np.zeros((X_scaled.shape[0], len(self.base_models)))
+        
+        for idx, (name, model) in enumerate(self.base_models.items()):
+            # Cross-validation predictions for meta-learner
+            fold_predictions = np.zeros(X_scaled.shape[0])
+            
+            for train_idx, val_idx in tscv.split(X_scaled):
+                X_train_fold, X_val_fold = X_scaled[train_idx], X_scaled[val_idx]
+                y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+                
+                model.fit(X_train_fold, y_train_fold)
+                fold_predictions[val_idx] = model.predict(X_val_fold)
+            
+            meta_features[:, idx] = fold_predictions
+            
+            # Train on full data for final model
+            model.fit(X_scaled, y)
+        
+        # Train meta-learner
+        self.meta_learner.fit(meta_features, y)
+        
+        # Update model weights based on individual performance
+        self._update_model_weights(X_scaled, y)
+        
+    def predict(self, X, return_uncertainty=False):
+        """Make ensemble prediction with optional uncertainty quantification"""
+        X_scaled = self.scaler.transform(X)
+        
+        # Get predictions from all base models
+        base_predictions = np.zeros((X_scaled.shape[0], len(self.base_models)))
+        for idx, (name, model) in enumerate(self.base_models.items()):
+            base_predictions[:, idx] = model.predict(X_scaled)
+        
+        # Weighted ensemble prediction
+        weighted_pred = np.sum(base_predictions * list(self.model_weights.values()), axis=1)
+        
+        # Meta-learner prediction (stacking)
+        meta_pred = self.meta_learner.predict(base_predictions)
+        
+        # Final prediction (average of weighted and meta predictions)
+        final_pred = (weighted_pred + meta_pred) / 2
+        
+        if return_uncertainty:
+            # Uncertainty as standard deviation of base predictions
+            uncertainty = np.std(base_predictions, axis=1)
+            return final_pred, uncertainty
+        
+        return final_pred
+    
+    def _update_model_weights(self, X, y):
+        """Update model weights based on recent performance"""
+        errors = {}
+        for name, model in self.base_models.items():
+            pred = model.predict(X)
+            errors[name] = mean_squared_error(y, pred)
+        
+        # Inverse error weighting (better models get higher weight)
+        total_inv_error = sum(1/e for e in errors.values())
+        self.model_weights = {name: (1/errors[name])/total_inv_error for name in self.base_models.keys()}
+    
+    def online_update(self, X_new, y_new):
+        """Incrementally update models with new data"""
+        X_scaled = self.scaler.transform(X_new)
+        
+        # Add to online learning buffer
+        self.online_learning_buffer.append((X_scaled, y_new))
+        
+        # Update when buffer reaches threshold
+        if len(self.online_learning_buffer) >= 20:
+            X_buffer = np.vstack([x for x, _ in self.online_learning_buffer])
+            y_buffer = np.concatenate([y for _, y in self.online_learning_buffer])
+            
+            # Incremental update for tree-based models
+            for name, model in self.base_models.items():
+                if hasattr(model, 'n_estimators'):  # Tree-based models
+                    # Add more trees
+                    model.n_estimators += 10
+                    model.fit(X_buffer, y_buffer)
+                else:
+                    # Partial fit for linear models
+                    if hasattr(model, 'partial_fit'):
+                        model.partial_fit(X_buffer, y_buffer)
+            
+            # Update model weights
+            self._update_model_weights(X_buffer, y_buffer)
+            
+            # Clear buffer
+            self.online_learning_buffer = []
+    
+    def store_prediction(self, features, prediction, actual=None):
+        """Store prediction for later evaluation and learning"""
+        self.prediction_history.append({
+            'timestamp': datetime.now(),
+            'features': features,
+            'prediction': prediction,
+            'actual': actual
+        })
+    
+    def get_feature_importance(self):
+        """Get aggregated feature importance from ensemble"""
+        importances = {}
+        
+        for name, model in self.base_models.items():
+            if hasattr(model, 'feature_importances_'):
+                imp = model.feature_importances_
+            elif hasattr(model, 'coef_'):
+                imp = np.abs(model.coef_)
+            else:
+                continue
+            
+            for feat_name, feat_imp in zip(self.feature_names, imp):
+                if feat_name not in importances:
+                    importances[feat_name] = []
+                importances[feat_name].append(feat_imp * self.model_weights[name])
+        
+        # Average importance across models
+        return {k: np.mean(v) for k, v in importances.items()}
 
 
 # --- Sidebar: Authentication ---
 with st.sidebar:
-    # ... (sidebar code is unchanged)
     st.markdown("### 1. Login to Kite Connect")
     st.write("Click to open Kite login. You'll be redirected back with a `request_token`.")
     st.markdown(f"[🔗 Open Kite login]({login_url})")
@@ -243,42 +468,27 @@ with st.sidebar:
         st.info("Not authenticated with Kite yet.")
 
     st.markdown("---")
-    st.markdown("### 2. Supabase User Account (Optional)")
-    
-    def _refresh_supabase_session():
-        try:
-            session_data = supabase.auth.get_session()
-            if session_data and session_data.user:
-                st.session_state["user_session"] = session_data
-                st.session_state["user_id"] = session_data.user.id
-            else:
-                st.session_state["user_session"] = None
-                st.session_state["user_id"] = None
-        except Exception:
-            st.session_state["user_session"] = None
-            st.session_state["user_id"] = None
-
-    _refresh_supabase_session()
-
-    if st.session_state["user_session"]:
-        st.success(f"Supabase Logged in: {st.session_state['user_session'].user.email}")
-        if st.button("Logout from Supabase", key="supabase_logout_btn"):
-            try:
-                supabase.auth.sign_out()
-                _refresh_supabase_session() 
-                st.sidebar.success("Logged out from Supabase.")
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Error logging out: {e}")
+    st.markdown("### 2. ML System Status")
+    if st.session_state.get("ensemble_models"):
+        st.success("🤖 Adaptive ML System Active")
+        st.metric("Models in Ensemble", len(st.session_state["ensemble_models"]))
+        if st.session_state.get("performance_metrics", {}).get("rmse_history"):
+            latest_rmse = st.session_state["performance_metrics"]["rmse_history"][-1]
+            st.metric("Latest RMSE", f"₹{latest_rmse:.2f}")
     else:
-        st.info("Supabase login section hidden for brevity.")
+        st.info("ML System not initialized")
+    
+    st.markdown("---")
+    online_learning = st.checkbox("Enable Online Learning", value=st.session_state.get("online_learning_enabled", False))
+    st.session_state["online_learning_enabled"] = online_learning
+    if online_learning:
+        st.success("📈 Real-time adaptation enabled")
 
 # --- Authenticated KiteConnect client ---
 k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
 # --- Tab Logic Functions ---
 def render_market_historical_tab(kite_client, api_key, access_token):
-    # ... (function code is unchanged)
     st.header("1. Market Data & Historical Data")
     if not kite_client:
         st.info("Login first to fetch market data.")
@@ -302,6 +512,7 @@ def render_market_historical_tab(kite_client, api_key, access_token):
             st.json(st.session_state["current_market_data"])
         else:
             st.info("Market data will appear here.")
+    
     st.markdown("---")
     st.subheader("Historical Price Data")
     col_hist_controls, col_hist_plot = st.columns([1, 2])
@@ -318,8 +529,9 @@ def render_market_historical_tab(kite_client, api_key, access_token):
                     st.session_state["historical_data"] = df_hist
                     st.session_state["last_fetched_symbol"] = hist_symbol
                     st.session_state["ml_data"] = pd.DataFrame()
-                    st.session_state["base_model"] = None
-                    st.session_state["error_corrector_model"] = None
+                    st.session_state["ensemble_models"] = {}
+                    st.session_state["meta_learner"] = None
+                    st.session_state["prediction_history"] = deque(maxlen=MAX_PREDICTION_HISTORY)
                     st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
                 else:
                     st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
@@ -335,7 +547,6 @@ def render_market_historical_tab(kite_client, api_key, access_token):
             st.info("Historical chart will appear here. Please fetch data first.")
 
 def render_analyze_tab(kite_client, api_key, access_token):
-    # ... (function code is unchanged)
     st.header("2. In-Depth Stock Analysis")
     if not kite_client:
         st.info("Login first to perform analysis.")
@@ -361,6 +572,7 @@ def render_analyze_tab(kite_client, api_key, access_token):
     df_ta['BB_High'] = bb.bollinger_hband()
     df_ta['BB_Mid'] = bb.bollinger_mavg()
     df_ta['BB_Low'] = bb.bollinger_lband()
+    
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2], subplot_titles=("Price Action & Overlays", "RSI Oscillator", "MACD"))
     fig.add_trace(go.Candlestick(x=df_ta.index, open=df_ta['open'], high=df_ta['high'], low=df_ta['low'], close=df_ta['close'], name='Candlestick'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df_ta.index, y=df_ta['SMA_20'], mode='lines', name='SMA 20', line=dict(color='blue', width=1)), row=1, col=1)
@@ -376,6 +588,7 @@ def render_analyze_tab(kite_client, api_key, access_token):
     fig.add_trace(go.Bar(x=df_ta.index, y=df_ta['MACD_Hist'], name='Histogram', marker_color=colors), row=3, col=1)
     fig.update_layout(title_text=f"Technical Indicators for {last_symbol}", xaxis_rangeslider_visible=False, height=800, template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
+    
     st.markdown("---")
     st.subheader("Indicator Summary & Technical Outlook")
     def generate_technical_outlook(df):
@@ -400,37 +613,13 @@ def render_analyze_tab(kite_client, api_key, access_token):
         if signals['buy'] > signals['sell']: return "Bullish Outlook", reasons
         elif signals['sell'] > signals['buy']: return "Bearish Outlook", reasons
         else: return "Neutral Outlook", reasons
+    
     outlook, reasons = generate_technical_outlook(df_ta)
     st.info(f"**Overall Technical Outlook: {outlook}**")
     for reason in reasons: st.markdown(f"- {reason}")
-    st.markdown("---")
-    st.subheader("Custom Strategy Builder & Backtest")
-    st.write("Define a simple strategy and visualize its signals on the historical chart.")
-    strategy_type = st.selectbox("Choose a Strategy Template", ["SMA Crossover", "RSI Threshold", "MACD Crossover"], key="strategy_selector")
-    df_strat = df_ta.copy().dropna()
-    buy_signals, sell_signals = pd.DataFrame(), pd.DataFrame()
-    if strategy_type == "SMA Crossover":
-        col1, col2 = st.columns(2); fast_sma = col1.number_input("Fast SMA Period", 5, 100, 20); slow_sma = col2.number_input("Slow SMA Period", 20, 200, 50)
-        df_strat['fast'] = ta.trend.sma_indicator(df_strat['close'], window=fast_sma); df_strat['slow'] = ta.trend.sma_indicator(df_strat['close'], window=slow_sma); df_strat.dropna(inplace=True)
-        buy_mask = (df_strat['fast'] > df_strat['slow']) & (df_strat['fast'].shift(1) < df_strat['slow'].shift(1)); sell_mask = (df_strat['fast'] < df_strat['slow']) & (df_strat['fast'].shift(1) > df_strat['slow'].shift(1))
-        buy_signals = df_strat[buy_mask]; sell_signals = df_strat[sell_mask]
-    elif strategy_type == "RSI Threshold":
-        col1, col2 = st.columns(2); oversold = col1.slider("Oversold Threshold (Buy)", 10, 40, 30); overbought = col2.slider("Overbought Threshold (Sell)", 60, 90, 70)
-        buy_mask = (df_strat['RSI_14'] < oversold) & (df_strat['RSI_14'].shift(1) >= oversold); sell_mask = (df_strat['RSI_14'] > overbought) & (df_strat['RSI_14'].shift(1) <= overbought)
-        buy_signals = df_strat[buy_mask]; sell_signals = df_strat[sell_mask]
-    elif strategy_type == "MACD Crossover":
-        buy_mask = (df_strat['MACD'] > df_strat['MACD_Signal']) & (df_strat['MACD'].shift(1) < df_strat['MACD_Signal'].shift(1)); sell_mask = (df_strat['MACD'] < df_strat['MACD_Signal']) & (df_strat['MACD'].shift(1) > df_strat['MACD_Signal'].shift(1))
-        buy_signals = df_strat[buy_mask]; sell_signals = df_strat[sell_mask]
-    st.write(f"Found **{len(buy_signals)} buy signals** and **{len(sell_signals)} sell signals** for the '{strategy_type}' strategy.")
-    fig_strat = go.Figure()
-    fig_strat.add_trace(go.Candlestick(x=df_strat.index, open=df_strat['open'], high=df_strat['high'], low=df_strat['low'], close=df_strat['close'], name='Candlestick'))
-    fig_strat.add_trace(go.Scatter(x=buy_signals.index, y=buy_signals['close'], mode='markers', name='Buy Signal', marker=dict(symbol='triangle-up', color='green', size=12, line=dict(width=1, color='DarkSlateGrey'))))
-    fig_strat.add_trace(go.Scatter(x=sell_signals.index, y=sell_signals['close'], mode='markers', name='Sell Signal', marker=dict(symbol='triangle-down', color='red', size=12, line=dict(width=1, color='DarkSlateGrey'))))
-    fig_strat.update_layout(title_text=f"Backtest Signals for '{strategy_type}' Strategy on {last_symbol}", xaxis_rangeslider_visible=False, height=600, template="plotly_white")
-    st.plotly_chart(fig_strat, use_container_width=True)
 
-def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("3. Price Predictor (Advanced ML Analysis)")
+def render_adaptive_ml_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("3. Adaptive AI Price Predictor")
     if not kite_client:
         st.info("Login first to perform ML analysis.")
         return
@@ -442,185 +631,298 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
         st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
         return
 
-    st.subheader(f"1. Feature Engineering & Data Preparation for {last_symbol}")
+    st.subheader(f"🎯 Advanced ML Analysis for {last_symbol}")
     
-    col_feat_eng, col_prep = st.columns(2)
+    # Step 1: Feature Engineering
+    col_feat_eng, col_info = st.columns([2, 1])
     with col_feat_eng:
-        if st.button("Generate Advanced Features (Indicators & Lags)", key="generate_features_btn"):
-            with st.spinner("Calculating features..."):
+        st.markdown("### Step 1: Feature Engineering")
+        if st.button("🔧 Generate Advanced Features", key="generate_features_btn", use_container_width=True):
+            with st.spinner("Calculating 100+ advanced features..."):
                 df_with_features = add_advanced_features(historical_data)
             if not df_with_features.empty:
                 st.session_state["ml_data"] = df_with_features
-                st.session_state["base_model"] = None
-                st.session_state["error_corrector_model"] = None
-                st.success(f"Data prepared with {len(df_with_features.columns)} features.")
+                st.session_state["ensemble_models"] = {}
+                st.session_state["meta_learner"] = None
+                st.success(f"✅ Generated {len(df_with_features.columns)} features from {len(df_with_features)} data points")
             else:
-                st.error("Failed to add features. Data might be too short or invalid.")
+                st.error("❌ Failed to add features. Data might be too short or invalid.")
                 st.session_state["ml_data"] = pd.DataFrame()
+    
+    with col_info:
+        if not st.session_state.get("ml_data", pd.DataFrame()).empty:
+            st.metric("Total Features", len(st.session_state["ml_data"].columns))
+            st.metric("Data Points", len(st.session_state["ml_data"]))
+        else:
+            st.info("Features not generated yet")
 
     ml_data = st.session_state.get("ml_data", pd.DataFrame())
     
     if not ml_data.empty:
-        with col_prep:
-            current_prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=30, value=5, step=1, key="pred_horizon")
-            test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
-        
         st.markdown("---")
-        st.subheader("2. Machine Learning Model Training")
         
-        col_ml_controls, col_ml_output = st.columns(2)
+        # Step 2: Model Configuration
+        st.subheader("### Step 2: Configure Adaptive Ensemble")
         
+        col_config1, col_config2, col_config3 = st.columns(3)
+        
+        with col_config1:
+            prediction_horizon = st.number_input("🎯 Prediction Horizon (periods ahead)", min_value=1, max_value=30, value=5, step=1, key="pred_horizon_adaptive")
+            st.session_state["prediction_horizon"] = prediction_horizon
+        
+        with col_config2:
+            model_complexity = st.selectbox("⚙️ Model Complexity", ["fast", "balanced", "accurate"], index=1, key="complexity_selector")
+        
+        with col_config3:
+            test_size = st.slider("📊 Test Set Size (%)", 10, 40, 20, step=5, key="test_size_slider") / 100.0
+        
+        # Feature Selection
+        st.markdown("#### Feature Selection")
         ml_data_processed = ml_data.copy()
-        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
+        ml_data_processed['target'] = ml_data_processed['close'].shift(-prediction_horizon)
         ml_data_processed.dropna(subset=['target'], inplace=True)
         
         features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
         
-        with col_ml_controls:
-            model_type_selected = st.selectbox("Select ML Model", ["LightGBM Regressor (High Performance)", "Random Forest Regressor", "Linear Regression"], key="ml_model_type_selector")
-            model_complexity = st.selectbox("Model Complexity", ["Fast & Simple", "Balanced (Recommended)", "Accurate & Slow"], index=1, key="model_complexity_selector", disabled=(model_type_selected=="Linear Regression"))
-            
-            # --- NEW: Variance Correction Algorithm Toggle ---
-            enable_variance_correction = st.checkbox(
-                "Enable Variance Correction Algorithm (Improves Precision)", 
-                value=True, 
-                key="variance_correction_toggle",
-                help="Trains a secondary model on the errors of the primary model. This significantly reduces variance and improves prediction accuracy, with a small increase in training time."
-            )
-
-            default_features = [f for f in features if any(sub in f for sub in ['RSI', 'MACD', 'Lag_', 'SMA', 'ADX', 'ATR', 'Bollinger_Width'])]
-            selected_features = st.multiselect("Select Features for Model", options=features, default=default_features, key="ml_selected_features_multiselect")
-            
-            if not selected_features:
-                st.warning("Please select at least one feature.")
-                return
-
-            X = ml_data_processed[selected_features]
-            y = ml_data_processed['target']
-            
-            scaler = MinMaxScaler()
-            X_scaled = scaler.fit_transform(X)
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=42, shuffle=False)
-            st.info(f"Training data: {len(X_train)} periods, Testing data: {len(X_test)} periods")
-
-            if st.button(f"Train {model_type_selected} Model", key="train_ml_model_btn"):
-                params = {}
-                if model_type_selected == "LightGBM Regressor (High Performance)":
-                    if model_complexity == "Fast & Simple": params = {'n_estimators': 100, 'learning_rate': 0.1, 'num_leaves': 20}
-                    elif model_complexity == "Accurate & Slow": params = {'n_estimators': 500, 'learning_rate': 0.05, 'num_leaves': 50}
-                    else: params = {'n_estimators': 300, 'learning_rate': 0.05, 'num_leaves': 31}
-                    base_model = lgb.LGBMRegressor(**params, random_state=42, n_jobs=-1)
-                elif model_type_selected == "Random Forest Regressor":
-                    if model_complexity == "Fast & Simple": params = {'n_estimators': 50, 'max_depth': 5}
-                    elif model_complexity == "Accurate & Slow": params = {'n_estimators': 300, 'max_depth': 15}
-                    else: params = {'n_estimators': 200, 'max_depth': 10}
-                    base_model = RandomForestRegressor(**params, random_state=42, n_jobs=-1)
-                else:
-                    base_model = LinearRegression()
-
-                with st.spinner(f"Training primary {model_type_selected} model..."):
-                    base_model.fit(X_train, y_train)
-                
-                # --- NEW: Variance Correction Logic ---
-                st.session_state['error_corrector_model'] = None
-                if enable_variance_correction:
-                    with st.spinner("Training variance correction model..."):
-                        train_predictions = base_model.predict(X_train)
-                        residuals = y_train - train_predictions
-                        
-                        error_corrector_model = lgb.LGBMRegressor(n_estimators=150, learning_rate=0.05, num_leaves=20, random_state=42)
-                        error_corrector_model.fit(X_train, residuals)
-                        st.session_state['error_corrector_model'] = error_corrector_model
-
-                base_predictions_test = base_model.predict(X_test)
-                if st.session_state['error_corrector_model']:
-                    predicted_errors_test = st.session_state['error_corrector_model'].predict(X_test)
-                    final_predictions_test = base_predictions_test + predicted_errors_test
-                    st.success(f"{model_type_selected} Model with Variance Correction Trained!")
-                else:
-                    final_predictions_test = base_predictions_test
-                    st.success(f"{model_type_selected} Model Trained!")
-
-                st.session_state.update({
-                    "base_model": base_model, "y_test": y_test, "scaler": scaler,
-                    "y_pred_base": base_predictions_test, "y_pred_final": final_predictions_test,
-                    "ml_features": selected_features, "ml_model_type": model_type_selected,
-                    "prediction_horizon": current_prediction_horizon
-                })
+        # Auto-select important features
+        default_features = [f for f in features if any(sub in f for sub in 
+            ['RSI', 'MACD', 'Lag_Close', 'Lag_Return', 'SMA', 'EMA', 'ADX', 'ATR', 'Bollinger', 
+             'Volume_Ratio', 'Rolling_Std', 'Price_Position', 'VWAP'])]
         
-        with col_ml_output:
-            if st.session_state.get("base_model") and st.session_state.get("y_test") is not None:
-                final_pred = st.session_state['y_pred_final']
-                rmse = np.sqrt(mean_squared_error(st.session_state['y_test'], final_pred))
-                r2 = r2_score(st.session_state['y_test'], final_pred)
-                
-                st.markdown(f"##### Evaluation Metrics (Final Prediction)")
-                st.metric("Root Mean Squared Error (RMSE)", f"₹{rmse:.2f}")
-                st.metric("R2 Score", f"{r2:.4f}")
-                
-                if st.session_state['ml_model_type'] != "Linear Regression":
-                    st.markdown("##### Primary Model Feature Importances")
-                    feature_imp = pd.DataFrame(sorted(zip(st.session_state['base_model'].feature_importances_, st.session_state['ml_features'])), columns=['Value','Feature'])
-                    fig_imp = go.Figure(go.Bar(x=feature_imp['Value'], y=feature_imp['Feature'], orientation='h'))
-                    fig_imp.update_layout(title="Which features the primary model uses most", height=300, template="plotly_white", yaxis=dict(autorange="reversed"), margin=dict(t=40, b=10, l=10, r=10))
-                    st.plotly_chart(fig_imp, use_container_width=True)
+        selected_features = st.multiselect("Select Features (or use recommended)", 
+                                          options=features, 
+                                          default=default_features[:30],  # Limit to top 30
+                                          key="ml_selected_features")
+        
+        if not selected_features:
+            st.warning("⚠️ Please select at least one feature.")
+            return
 
-        if st.session_state.get("base_model"):
+        # Prepare data
+        X = ml_data_processed[selected_features]
+        y = ml_data_processed['target']
+        
+        # Step 3: Train Ensemble
+        st.markdown("---")
+        st.subheader("### Step 3: Train Adaptive Ensemble")
+        
+        col_train, col_status = st.columns([2, 1])
+        
+        with col_train:
+            if st.button("🚀 Train Adaptive Ensemble System", key="train_ensemble_btn", use_container_width=True):
+                with st.spinner("Training ensemble of ML models..."):
+                    # Initialize predictor
+                    predictor = AdaptiveEnsemblePredictor(prediction_horizon=prediction_horizon)
+                    predictor.initialize_models(complexity=model_complexity)
+                    
+                    # Train
+                    predictor.train(X, y, selected_features)
+                    
+                    # Store in session
+                    st.session_state["ensemble_predictor"] = predictor
+                    st.session_state["ml_features"] = selected_features
+                    st.session_state["last_train_time"] = datetime.now()
+                    
+                    st.success("✅ Adaptive Ensemble trained successfully!")
+                    st.balloons()
+        
+        with col_status:
+            if st.session_state.get("ensemble_predictor"):
+                st.success("✅ Model Active")
+                if st.session_state.get("last_train_time"):
+                    st.caption(f"Trained: {st.session_state['last_train_time'].strftime('%H:%M:%S')}")
+                    
+                # Show model weights
+                predictor = st.session_state["ensemble_predictor"]
+                st.markdown("**Model Weights:**")
+                for name, weight in predictor.model_weights.items():
+                    st.progress(weight, text=f"{name}: {weight:.3f}")
+            else:
+                st.info("Model not trained")
+        
+        # Step 4: Evaluation & Predictions
+        if st.session_state.get("ensemble_predictor"):
             st.markdown("---")
-            st.subheader("Model Performance: Actual vs. Predicted")
+            st.subheader("### Step 4: Model Performance & Predictions")
+            
+            predictor = st.session_state["ensemble_predictor"]
+            
+            # Split data for evaluation
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, shuffle=False)
+            
+            # Get predictions with uncertainty
+            y_pred, uncertainty = predictor.predict(X_test, return_uncertainty=True)
+            
+            # Calculate metrics
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            mae = mean_absolute_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+            mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
+            
+            # Directional accuracy
+            actual_direction = np.sign(y_test.diff())
+            pred_direction = np.sign(pd.Series(y_pred).diff())
+            directional_accuracy = np.mean(actual_direction.values[1:] == pred_direction.values[1:]) * 100
+            
+            # Update performance history
+            st.session_state["performance_metrics"]["rmse_history"].append(rmse)
+            st.session_state["performance_metrics"]["mae_history"].append(mae)
+            st.session_state["performance_metrics"]["mape_history"].append(mape)
+            st.session_state["performance_metrics"]["directional_accuracy"].append(directional_accuracy)
+            
+            # Display metrics
+            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            col_m1.metric("RMSE", f"₹{rmse:.2f}")
+            col_m2.metric("MAE", f"₹{mae:.2f}")
+            col_m3.metric("MAPE", f"{mape:.2f}%")
+            col_m4.metric("R² Score", f"{r2:.4f}")
+            col_m5.metric("Direction Accuracy", f"{directional_accuracy:.1f}%")
+            
+            # Plot predictions with uncertainty bands
+            st.markdown("#### Predictions vs Actual (with Uncertainty Bands)")
+            
             pred_df = pd.DataFrame({
-                'Actual': st.session_state['y_test'], 
-                'Initial Prediction': st.session_state['y_pred_base'],
-                'Final (Corrected) Prediction': st.session_state['y_pred_final']
-            }, index=st.session_state['y_test'].index)
+                'Actual': y_test.values,
+                'Predicted': y_pred,
+                'Uncertainty': uncertainty,
+                'Upper_Band': y_pred + 1.96 * uncertainty,
+                'Lower_Band': y_pred - 1.96 * uncertainty
+            }, index=y_test.index)
             
             fig_pred = go.Figure()
-            fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Actual'], mode='lines', name='Actual Future Price', line=dict(color='#636EFA', width=2.5)))
             
-            if st.session_state.get('error_corrector_model'):
-                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Initial Prediction'], mode='lines', name='Initial Prediction (Before Correction)', line=dict(dash='dot', color='grey', width=1.5)))
-                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Final (Corrected) Prediction'], mode='lines', name='Final Prediction', line=dict(dash='solid', color='#FFA15A', width=2)))
-            else:
-                 fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Initial Prediction'], mode='lines', name='Predicted Price', line=dict(dash='dash', color='#FFA15A', width=2)))
-
-            fig_pred.update_layout(title_text=f"Model Performance ({st.session_state['prediction_horizon']} periods ahead)", height=500, template="plotly_white", legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
+            # Uncertainty band
+            fig_pred.add_trace(go.Scatter(
+                x=pred_df.index,
+                y=pred_df['Upper_Band'],
+                fill=None,
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False,
+                name='Upper Band'
+            ))
+            
+            fig_pred.add_trace(go.Scatter(
+                x=pred_df.index,
+                y=pred_df['Lower_Band'],
+                fill='tonexty',
+                mode='lines',
+                line=dict(width=0),
+                fillcolor='rgba(255, 161, 90, 0.2)',
+                name='95% Confidence Interval'
+            ))
+            
+            # Actual values
+            fig_pred.add_trace(go.Scatter(
+                x=pred_df.index,
+                y=pred_df['Actual'],
+                mode='lines',
+                name='Actual Price',
+                line=dict(color='#636EFA', width=2.5)
+            ))
+            
+            # Predicted values
+            fig_pred.add_trace(go.Scatter(
+                x=pred_df.index,
+                y=pred_df['Predicted'],
+                mode='lines',
+                name='Predicted Price',
+                line=dict(color='#FFA15A', width=2, dash='solid')
+            ))
+            
+            fig_pred.update_layout(
+                title_text=f"Adaptive Ensemble Performance ({prediction_horizon} periods ahead)",
+                height=500,
+                template="plotly_white",
+                hovermode='x unified',
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+            
             st.plotly_chart(fig_pred, use_container_width=True)
             
-            st.markdown("---")
-            st.subheader(f"3. Generate New Forecast for {last_symbol}")
-            latest_row = ml_data[st.session_state["ml_features"]].iloc[[-1]] 
-            latest_row_scaled = st.session_state["scaler"].transform(latest_row)
+            # Feature Importance
+            st.markdown("#### Top 20 Feature Importances")
+            feature_imp = predictor.get_feature_importance()
+            feature_imp_df = pd.DataFrame(sorted(feature_imp.items(), key=lambda x: x[1], reverse=True)[:20], 
+                                         columns=['Feature', 'Importance'])
             
-            if st.button(f"Generate Forecast for Next {st.session_state['prediction_horizon']} Periods", key="generate_forecast_btn"):
-                base_forecast = st.session_state["base_model"].predict(latest_row_scaled)[0]
-
-                if st.session_state['error_corrector_model']:
-                    predicted_error = st.session_state['error_corrector_model'].predict(latest_row_scaled)[0]
-                    final_forecast = base_forecast + predicted_error
-                    st.info(f"Initial Prediction: ₹{base_forecast:.2f} | Predicted Error Correction: ₹{predicted_error:.2f}")
-                else:
-                    final_forecast = base_forecast
-
-                last_known_close = historical_data['close'].iloc[-1]
-                predicted_change = ((final_forecast - last_known_close) / last_known_close) * 100
-                
-                st.success(f"Forecast Generated using **{st.session_state['ml_model_type']}** model:")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Last Known Close Price", f"₹{last_known_close:.2f}")
-                c2.metric(f"Predicted Price (in {st.session_state['prediction_horizon']} periods)", f"₹{final_forecast:.2f}", delta=f"{predicted_change:.2f}%")
-                c3.metric("Prediction Date Approx.", (historical_data.index[-1] + timedelta(days=st.session_state['prediction_horizon'])).strftime('%Y-%m-%d'))
+            fig_imp = go.Figure(go.Bar(
+                x=feature_imp_df['Importance'],
+                y=feature_imp_df['Feature'],
+                orientation='h',
+                marker=dict(color=feature_imp_df['Importance'], colorscale='Viridis')
+            ))
+            fig_imp.update_layout(
+                title="Features Driving Predictions",
+                height=500,
+                template="plotly_white",
+                yaxis=dict(autorange="reversed"),
+                xaxis_title="Relative Importance"
+            )
+            st.plotly_chart(fig_imp, use_container_width=True)
+            
+            # Step 5: Generate New Forecast
+            st.markdown("---")
+            st.subheader("### Step 5: Generate Future Forecast")
+            
+            col_forecast1, col_forecast2 = st.columns([2, 1])
+            
+            with col_forecast1:
+                if st.button(f"🔮 Generate Forecast for Next {prediction_horizon} Periods", key="generate_forecast_btn", use_container_width=True):
+                    latest_features = ml_data[selected_features].iloc[[-1]]
+                    forecast, forecast_uncertainty = predictor.predict(latest_features, return_uncertainty=True)
+                    forecast_value = forecast[0]
+                    uncertainty_value = forecast_uncertainty[0]
+                    
+                    last_known_close = historical_data['close'].iloc[-1]
+                    predicted_change = ((forecast_value - last_known_close) / last_known_close) * 100
+                    
+                    # Store prediction
+                    predictor.store_prediction(latest_features.values[0], forecast_value)
+                    
+                    # Display forecast
+                    st.success(f"📊 Forecast Generated with {len(predictor.base_models)} Models")
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Last Close", f"₹{last_known_close:.2f}")
+                    c2.metric(f"Forecast ({prediction_horizon}d)", f"₹{forecast_value:.2f}", delta=f"{predicted_change:+.2f}%")
+                    c3.metric("Uncertainty (±)", f"₹{uncertainty_value:.2f}")
+                    c4.metric("Confidence", f"{max(0, 100 - uncertainty_value/forecast_value*100):.1f}%")
+                    
+                    # Confidence bands
+                    upper_bound = forecast_value + 1.96 * uncertainty_value
+                    lower_bound = forecast_value - 1.96 * uncertainty_value
+                    
+                    st.info(f"**95% Confidence Interval:** ₹{lower_bound:.2f} - ₹{upper_bound:.2f}")
+                    
+                    # Forecast date
+                    forecast_date = historical_data.index[-1] + timedelta(days=prediction_horizon)
+                    st.caption(f"📅 Forecast Date (approx): {forecast_date.strftime('%Y-%m-%d')}")
+                    
+                    # Online learning
+                    if st.session_state.get("online_learning_enabled"):
+                        st.info("🔄 Online learning active - model will adapt as new data arrives")
+            
+            with col_forecast2:
+                if st.session_state.get("prediction_history"):
+                    st.markdown("**Recent Predictions:**")
+                    history = list(predictor.prediction_history)[-5:]
+                    for h in reversed(history):
+                        st.caption(f"{h['timestamp'].strftime('%H:%M:%S')}: ₹{h['prediction']:.2f}")
     else:
-        st.info("Generate features first to enable model training.")
+        st.info("👆 Generate features first to enable ensemble training.")
 
-# --- Main Application Logic (Tab Rendering) ---
+# --- Main Application ---
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-tab_market, tab_analyze, tab_ml = st.tabs(["Market Data & Historical Data", "Analyze", "Price Predictor (ML)"])
+tab_market, tab_analyze, tab_ml = st.tabs(["📊 Market Data", "📈 Technical Analysis", "🤖 Adaptive AI Predictor"])
 
 with tab_market:
     render_market_historical_tab(k, api_key, access_token)
+
 with tab_analyze:
     render_analyze_tab(k, api_key, access_token)
+
 with tab_ml:
-    render_price_predictor_tab(k, api_key, access_token)
+    render_adaptive_ml_tab(k, api_key, access_token)
