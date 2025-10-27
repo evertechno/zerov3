@@ -63,11 +63,21 @@ for key, default_value in session_defaults.items():
         st.session_state[key] = default_value
 
 # --- Load Credentials ---
-@st.cache_data
 def load_secrets():
+    """Load credentials from Streamlit secrets without caching the secrets object"""
     secrets = st.secrets
-    kite_conf = secrets.get("kite", {})
-    supabase_conf = secrets.get("supabase", {})
+    
+    # Extract values immediately to avoid caching issues
+    kite_conf = {
+        "api_key": secrets.get("kite", {}).get("api_key", ""),
+        "api_secret": secrets.get("kite", {}).get("api_secret", ""),
+        "redirect_uri": secrets.get("kite", {}).get("redirect_uri", "")
+    }
+    
+    supabase_conf = {
+        "url": secrets.get("supabase", {}).get("url", ""),
+        "anon_key": secrets.get("supabase", {}).get("anon_key", "")
+    }
 
     errors = []
     if not kite_conf.get("api_key") or not kite_conf.get("api_secret") or not kite_conf.get("redirect_uri"):
