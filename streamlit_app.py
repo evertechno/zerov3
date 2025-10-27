@@ -1789,3 +1789,174 @@ with tabs[3]:
             try:
                 df = pd.read_csv(uploaded)
                 df.columns = [str(c).strip().lower().replace(' ', '_').replace('.', '').replace('/','_') for c in df.columns]
+                
+                header_map = {
+                    'isin': 'ISIN', 'name_of_the_instrument': 'Name', 'symbol': 'Symbol',
+                    'industry': 'Industry', 'quantity': 'Quantity', 'rating': 'Rating',
+                    'asset_class': 'Asset Class', 'market_fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)'
+                }
+                df = df.rename(columns=header_map)
+                
+                for col in ['Rating', 'Asset Class', 'Industry']:
+                    if col in df.columns:
+                        df[col] = df[col].str.strip().str.upper()
+
+                missing = [c for c in ['Symbol', 'Quantity', 'Uploaded Value (Lacs)', 'Industry'] if c not in df.columns]
+                if missing:
+                    st.error(f"Missing columns: {', '.join(missing)}")
+                    st.session_state.compliance_results_df = pd.DataFrame()
+                else:
+                    df['Symbol'] = df['Symbol'].str.strip().str.upper()
+                    df['Quantity'] = pd.to_numeric(df['Quantity'].astype(str).str.replace(',', ''), errors='coerce')
+                    df['Uploaded Value (Lacs)'] = pd.to_numeric(df['Uploaded Value (Lacs)'], errors='coerce')
+                    df.dropna(subset=['Symbol', 'Quantity', 'Uploaded Value (Lacs)'], inplace=True)
+
+                    if st.button("Analyze Portfolio", type="primary", use_container_width=True):
+                        with st.spinner("Analyzing..."):
+                            symbols = df['Symbol'].unique().tolist()
+                            instrument_ids = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols]
+                            
+                            try:
+                                ltp_data = k.ltp(instrument_ids)
+                                prices = {sym: ltp_data.get(f"{DEFAULT_EXCHANGE}:{sym}", {}).get('last_price') for sym in symbols}
+                                
+                                results = df.copy()
+                                results['LTP'] = results['Symbol'].map(prices)
+                                
+                                failed = results[results['LTP'].isna()]['Symbol'].tolist()
+                                if failed:
+                                    st.warning(f"No LTP for: {', '.join(failed)}")
+                                
+                                results['Real-time Value (Rs)'] = (results['LTP'] * results['Quantity']).fillna(0)
+                                total_val = results['Real-time Value (Rs)'].sum()
+                                results['Weight %'] = (results['Real-time Value (Rs)'] / total_val * 100) if total_val > 0 else 0
+                                
+                                st.session_state.compliance_results_df = results
+                                st.success("Analysis complete!")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                                st.session_state.compliance_results_df = pd.DataFrame()
+            except Exception as e:
+                st.error(f"File processing error: {e}")
+                st.session_state.compliance_results_df = pd.DataFrame()
+
+        results_df = st.session_state.get("compliance_results_df", pd.DataFrame())
+        if not results_df.empty and 'Weight %' in results_df.columns:
+            st.markdown("---")
+            
+            analysis_tabs = st.tabs(["📊 Dashboard", "🔍 Breakdowns", "⚖️ Compliance", "📄 Holdings"])
+
+            with analysis_tabs[0]:
+                st.subheader("Portfolio Dashboard")
+                total_val = results_df['Real-time Value (Rs)'].sum()
+                
+                kpi_cols = st.columns(4)
+                kpi_cols[0].metric("Portfolio Value", f"₹{total_val:,.2f}")
+                kpi_cols[1].metric("Holdings", f"{len(results_df)}")
+                kpi_cols[2].metric("Sectors", f"{results_df['Industry'].nunique()}")
+                if 'Rating' in results_df.columns:
+                    kpi_cols[3].metric("Ratings", f"{results_df['Rating'].nunique()}")
+
+                st.markdown("#### Concentration Analysis")
+                stock_hhi = (results_df['Weight %'] ** 2).sum()
+                sector_hhi = (results_df.groupby('Industry')['Weight %'].sum() ** 2).sum()
+                
+                def hhi_category(score):
+                    if score < 1500: return "Low Concentration"
+                    elif score <= 2500: return "Moderate"
+                    else: return "High Concentration"
+
+                conc_cols = st.columns(2)
+                with conc_cols[0]:
+                    st.metric("Top 5 Stocks", f"{results_df.nlargest(5, 'Weight %')['Weight %'].sum():.2f}%")
+                    st.metric("Top 10 Stocks", f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%")
+                    st.metric("Top 3 Sectors", f"{results_df.groupby('Industry')['Weight %'].sum().nlargest(3).sum():.2f}%")
+                with conc_cols[1]:
+                    st.metric("Stock HHI", f"{stock_hhi:,.0f}", help=hhi_category(stock_hhi))
+                    st.metric("Sector HHI", f"{sector_hhi:,.0f}", help=hhi_category(sector_hhi))
+                
+                st.info("HHI Scale: <1500 (Low), 1500-2500 (Moderate), >2500 (High)")
+
+            with analysis_tabs[1]:
+                st.subheader("Portfolio Breakdowns")
+                
+                path = ['Industry', 'Name']
+                if 'Asset Class' in results_df.columns:
+                    path.insert(0, 'Asset Class')
+                    results_df['Asset Class'] = results_df['Asset Class'].fillna('UNCLASSIFIED')
+                
+                fig_sun = px.sunburst(
+                    results_df, 
+                    path=path, 
+                    values='Real-time Value (Rs)',
+                    hover_data={'Weight %': ':.2f'}
+                )
+                fig_sun.update_layout(margin=dict(t=20, l=20, r=20, b=20), height=600)
+                st.plotly_chart(fig_sun, use_container_width=True)
+
+                breakdown_cols = st.columns(3)
+                with breakdown_cols[0]:
+                    st.markdown("##### By Sector")
+                    sector_wts = results_df.groupby('Industry')['Weight %'].sum().reset_index()
+                    fig_sec = px.pie(sector_wts, names='Industry', values='Weight %', hole=0.4)
+                    fig_sec.update_traces(textinfo='percent+label', showlegend=False)
+                    st.plotly_chart(fig_sec, use_container_width=True)
+                
+                with breakdown_cols[1]:
+                    if 'Asset Class' in results_df.columns:
+                        st.markdown("##### By Asset Class")
+                        asset_wts = results_df.groupby('Asset Class')['Weight %'].sum().reset_index()
+                        fig_asset = px.pie(asset_wts, names='Asset Class', values='Weight %', hole=0.4)
+                        fig_asset.update_traces(textinfo='percent+label', showlegend=False)
+                        st.plotly_chart(fig_asset, use_container_width=True)
+                
+                with breakdown_cols[2]:
+                    if 'Rating' in results_df.columns:
+                        st.markdown("##### By Rating")
+                        rating_wts = results_df.groupby('Rating')['Weight %'].sum().reset_index()
+                        fig_rating = px.pie(rating_wts, names='Rating', values='Weight %', hole=0.4)
+                        fig_rating.update_traces(textinfo='percent+label', showlegend=False)
+                        st.plotly_chart(fig_rating, use_container_width=True)
+
+            with analysis_tabs[2]:
+                st.subheader("Compliance Validation")
+                validation = parse_and_validate_rules(rules, results_df)
+                
+                if not validation:
+                    st.info("No rules defined or all rules valid.")
+                else:
+                    for res in validation:
+                        if res['status'] == "✅ PASS":
+                            st.success(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+                        elif res['status'] == "❌ FAIL":
+                            st.error(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+                        else:
+                            st.warning(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+
+            with analysis_tabs[3]:
+                st.subheader("Detailed Holdings")
+                display = results_df.copy()
+                format_dict = {
+                    'Real-time Value (Rs)': '₹{:,.2f}', 
+                    'LTP': '₹{:,.2f}', 
+                    'Weight %': '{:.2f}%'
+                }
+                
+                col_order = ['Name', 'Symbol', 'Industry', 'Real-time Value (Rs)', 'Weight %', 'Quantity', 'LTP']
+                if 'Asset Class' in display.columns:
+                    col_order.insert(3, 'Asset Class')
+                if 'Rating' in display.columns:
+                    col_order.insert(3, 'Rating')
+                
+                display_cols = [c for c in col_order if c in display.columns]
+                st.dataframe(display[display_cols].style.format(format_dict), use_container_width=True)
+
+                st.download_button(
+                    "📥 Download Report (CSV)",
+                    data=display[display_cols].to_csv(index=False).encode('utf-8'),
+                    file_name=f"portfolio_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+
+st.markdown("---")
+st.caption("Invsion Connect - Advanced Investment Analysis Platform | Powered by Kite Connect & Supabase")
