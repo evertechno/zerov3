@@ -2059,4 +2059,4 @@ with tab_index_price_calc:
     render_index_price_calc_tab(k, api_key, access_token)
 with tab_compliance:
     render_investment_compliance_tab(k, api_key, access_token)
-```
+
