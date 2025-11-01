@@ -1624,7 +1624,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     else:
         st.info("No saved indexes to manage yet. Load them using the button above.")
 
-# START: NEW/ENHANCED - INDEX PRICE CALCULATION TAB FUNCTION
+
 def render_index_price_calc_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("⚡ Live Index Price Calculator")
     st.markdown("Upload a CSV file with symbols and their weights to calculate a real-time index value based on the Last Traded Price (LTP).")
@@ -1717,9 +1717,8 @@ def render_index_price_calc_tab(kite_client: KiteConnect | None, api_key: str | 
 
                 except Exception as e:
                     st.error(f"An error occurred while fetching prices: {e}")
-# END: NEW/ENHANCED - INDEX PRICE CALCULATION TAB FUNCTION
 
-# START: NEW/ENHANCED - COMPLIANCE TAB FUNCTIONS
+# START: NEW/ENHANCED COMPLIANCE TAB FUNCTIONS
 def parse_and_validate_rules(rules_text: str, portfolio_df: pd.DataFrame):
     """Parses user-defined rules and validates them against the portfolio dataframe."""
     results = []
@@ -2045,7 +2044,6 @@ def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: s
                 file_name=f"realtime_portfolio_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv"
             )
-# END: NEW/ENHANCED - COMPLIANCE TAB FUNCTIONS
 
 # --- Main Application Logic (Tab Rendering) ---
 api_key = KITE_CREDENTIALS["api_key"]
@@ -2059,4 +2057,3 @@ with tab_index_price_calc:
     render_index_price_calc_tab(k, api_key, access_token)
 with tab_compliance:
     render_investment_compliance_tab(k, api_key, access_token)
-
