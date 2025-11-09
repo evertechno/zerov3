@@ -1,4 +1,790 @@
-import streamlit as st
+def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
+    st.header("📊 Custom Index Creation, Benchmarking & Export")
+    st.markdown("Create your own weighted index, analyze its historical performance, compare it against benchmarks, and calculate key financial metrics.")
+    
+    if not kite_client:
+        st.info("Login to Kite first to fetch live and historical prices for index constituents.")
+        return
+    if not st.session_state["user_id"]:
+        st.info("Login with your Supabase account in the sidebar to save and load custom indexes.")
+        return
+    if not api_key or not access_token:
+        st.info("Kite authentication details required for data access.")
+        return
+
+    @st.cache_data(ttl=3600, show_spinner="Fetching historical data for comparison...")
+    def _fetch_and_normalize_data_for_comparison(
+        name: str,
+        data_type: str,
+        comparison_start_date: datetime.date,
+        comparison_end_date: datetime.date,
+        constituents_df: pd.DataFrame = None,
+        symbol: str = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        api_key: str = None,
+        access_token: str = None,
+        use_normalized: bool = True
+    ) -> pd.DataFrame:
+        hist_df = pd.DataFrame()
+        if data_type == "custom_index":
+            if constituents_df is None or constituents_df.empty: return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
+            hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
+            if "_error" in hist_df.columns: return hist_df
+            data_series = hist_df['index_value'] if use_normalized else hist_df['raw_value']
+        elif data_type == "benchmark":
+            if symbol is None: return pd.DataFrame({"_error": [f"No symbol for benchmark {name}."]})
+            hist_df = get_historical_data_cached(api_key, access_token, symbol, comparison_start_date, comparison_end_date, "day", exchange)
+            if "_error" in hist_df.columns: return hist_df
+            data_series = hist_df['close']
+        else:
+            return pd.DataFrame({"_error": ["Invalid data_type for comparison."]})
+
+        if data_series.empty:
+            return pd.DataFrame({"_error": [f"No historical data for {name} within the selected range."]})
+
+        if use_normalized:
+            first_valid_index = data_series.first_valid_index()
+            if first_valid_index is not None and data_series[first_valid_index] != 0:
+                normalized_series = (data_series / data_series[first_valid_index]) * 100
+                return pd.DataFrame({'normalized_value': normalized_series, 'raw_values': data_series}).rename_axis('date')
+            return pd.DataFrame({"_error": [f"Could not normalize {name} (first value is zero or no valid data in range)."]})
+        else:
+            return pd.DataFrame({'value': data_series}).rename_axis('date')
+
+
+    def display_single_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None, is_recalculated_live=False):
+        st.markdown(f"#### Details for Index: **{index_name}** {'(Recalculated Live)' if is_recalculated_live else ''}")
+        
+        st.subheader("Constituents and Current Live Value")
+        
+        live_quotes = {}
+        symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
+        
+        if st.session_state["instruments_df"].empty:
+            st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+        
+        if "_error" not in st.session_state["instruments_df"].columns:
+            if symbols_for_ltp:
+                try:
+                    kc_client = get_authenticated_kite_client(api_key, access_token)
+                    if kc_client:
+                        instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                        ltp_data_batch = kc_client.ltp(instrument_identifiers)
+                        for sym in symbols_for_ltp:
+                            key = f"{DEFAULT_EXCHANGE}:{sym}"
+                            live_quotes[sym] = ltp_data_batch.get(key, {}).get("last_price", np.nan)
+                except Exception: pass
+
+        if 'Name' not in constituents_df.columns:
+            inst_names = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict() if not st.session_state["instruments_df"].empty else {}
+            constituents_df['Name'] = constituents_df['symbol'].map(inst_names).fillna(constituents_df['symbol'])
+
+        constituents_df_display = constituents_df.copy()
+        constituents_df_display["Last Price"] = constituents_df_display["symbol"].map(live_quotes)
+        constituents_df_display["Weighted Price"] = constituents_df_display["Last Price"] * constituents_df_display["Weights"]
+        current_live_value = constituents_df_display["Weighted Price"].sum()
+
+        st.dataframe(constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].style.format({
+            "Weights": "{:.4f}",
+            "Last Price": "₹{:,.2f}",
+            "Weighted Price": "₹{:,.2f}"
+        }), use_container_width=True)
+        st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
+
+        constituents_csv = constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Constituents Data (CSV)",
+            data=constituents_csv,
+            file_name=f"{index_name}_constituents.csv",
+            mime="text/csv",
+            key=f"download_constituents_csv_{index_id or index_name}"
+        )
+
+        st.markdown("---")
+        st.subheader("Index Composition")
+        fig_pie = go.Figure(data=[go.Pie(labels=constituents_df_display['Name'], values=constituents_df_display['Weights'], hole=.3)])
+        fig_pie.update_layout(title_text='Constituent Weights', height=400)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Export Options")
+        col_export1, col_export2 = st.columns(2)
+        with col_export2:
+            if not index_history_df.empty:
+                csv_history = index_history_df.to_csv().encode('utf-8')
+                st.download_button(label="Export Historical Performance to CSV", data=csv_history, file_name=f"{index_name}_historical_performance.csv", mime="text/csv", key=f"export_history_{index_id or index_name}")
+            else: st.info("No historical data to export for this index.")
+
+    st.markdown("---")
+    st.subheader("1. Create New Index")
+    
+    create_meth_c1, create_meth_c2 = st.columns(2)
+    
+    with create_meth_c1:
+        st.markdown("##### From CSV Upload")
+        uploaded_file = st.file_uploader("Upload CSV with index constituents", type=["csv"], key="index_upload_csv")
+        if uploaded_file:
+            try:
+                df_constituents_new = pd.read_csv(uploaded_file)
+                required_cols = {"symbol", "Weights"}
+                if not required_cols.issubset(set(df_constituents_new.columns)):
+                    st.error(f"CSV must contain columns: `symbol`, `Weights`. Recommended: `Name`. Missing: {required_cols - set(df_constituents_new.columns)}")
+                    return
+
+                df_constituents_new["Weights"] = pd.to_numeric(df_constituents_new["Weights"], errors='coerce')
+                df_constituents_new.dropna(subset=["Weights", "symbol"], inplace=True)
+                
+                if df_constituents_new.empty:
+                    st.error("No valid constituents found in the CSV. Ensure 'symbol' and numeric 'Weights' columns are present.")
+                    return
+
+                total_weights = df_constituents_new["Weights"].sum()
+                if total_weights <= 0:
+                    st.error("Sum of weights must be positive.")
+                    return
+                df_constituents_new["Weights"] = df_constituents_new["Weights"] / total_weights
+                if 'Name' not in df_constituents_new.columns:
+                     df_constituents_new['Name'] = df_constituents_new['symbol']
+                st.info(f"Loaded {len(df_constituents_new)} constituents from CSV. Weights have been normalized to sum to 1.")
+                st.session_state["current_calculated_index_data"] = df_constituents_new[['symbol', 'Name', 'Weights']]
+
+            except pd.errors.EmptyDataError:
+                st.error("The uploaded CSV file is empty.")
+            except Exception as e:
+                st.error(f"An error occurred while processing the file: {e}.")
+    
+    with create_meth_c2:
+        st.markdown("##### From Kite Holdings")
+        weighting_scheme = st.selectbox("Weighting Scheme", ["Equal Weight", "Value Weighted (Investment Value)"], key="holdings_weight_scheme")
+        if st.button("Create Index from Holdings", key="create_from_holdings_btn"):
+            holdings_df = st.session_state.get("holdings_data")
+            if holdings_df is None or holdings_df.empty:
+                st.warning("Please fetch holdings from the sidebar first.")
+            else:
+                df_constituents_new = holdings_df[holdings_df['product'] != 'CDS'].copy()
+                df_constituents_new.rename(columns={'tradingsymbol': 'symbol'}, inplace=True)
+                df_constituents_new['Name'] = df_constituents_new['symbol']
+                
+                if weighting_scheme == "Equal Weight":
+                    if len(df_constituents_new) == 0:
+                        st.error("No valid holdings found to create an index.")
+                        return 
+                    df_constituents_new['Weights'] = 1 / len(df_constituents_new)
+                else:
+                    df_constituents_new['investment_value'] = df_constituents_new['average_price'] * df_constituents_new['quantity']
+                    total_value = df_constituents_new['investment_value'].sum()
+                    if total_value == 0:
+                         st.error("Total investment value is zero, cannot calculate value weights.")
+                         return 
+                    df_constituents_new['Weights'] = df_constituents_new['investment_value'] / total_value
+                
+                st.session_state["current_calculated_index_data"] = df_constituents_new[['symbol', 'Name', 'Weights']]
+                st.success(f"Index created from {len(df_constituents_new)} holdings using {weighting_scheme}.")
+
+    current_calculated_index_data_df = st.session_state.get("current_calculated_index_data", pd.DataFrame())
+    current_calculated_index_history_df = st.session_state.get("current_calculated_index_history", pd.DataFrame())
+    
+    if not current_calculated_index_data_df.empty:
+        st.subheader("Configure Historical Calculation for New Index")
+        calc_c1, calc_c2 = st.columns(2)
+        with calc_c1:
+             hist_start_date = st.date_input("Historical Start Date", value=datetime.now().date() - timedelta(days=365), key="new_index_hist_start_date")
+        with calc_c2:
+             hist_end_date = st.date_input("Historical End Date", value=datetime.now().date(), key="new_index_hist_end_date")
+
+        if st.button("Calculate Historical Index Values", key="calculate_new_index_btn_final"):
+            if hist_start_date >= hist_end_date:
+                st.error("Historical start date must be before end date.")
+            else:
+                index_history_df_new = _calculate_historical_index_value(api_key, access_token, current_calculated_index_data_df, hist_start_date, hist_end_date, DEFAULT_EXCHANGE)
+            
+                if not index_history_df_new.empty and "_error" not in index_history_df_new.columns:
+                    st.session_state["current_calculated_index_history"] = index_history_df_new
+                    st.success("Historical index values calculated successfully.")
+                    st.session_state["factsheet_selected_constituents_index_names"] = ["Newly Calculated Index"] 
+                else:
+                    st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', ['Unknown error'])[0]}")
+                    st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                    st.session_state["factsheet_selected_constituents_index_names"] = []
+    
+    if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
+        constituents_df_for_live = current_calculated_index_data_df.copy()
+        live_quotes = {}
+        symbols_for_ltp = [sym for sym in constituents_df_for_live["symbol"]]
+
+        if symbols_for_ltp:
+            try:
+                kc_client = get_authenticated_kite_client(api_key, access_token)
+                instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                ltp_data_batch = kc_client.ltp(instrument_identifiers)
+                for sym in symbols_for_ltp:
+                    key = f"{DEFAULT_EXCHANGE}:{sym}"
+                    live_quotes[sym] = ltp_data_batch.get(key, {}).get("last_price", np.nan)
+            except Exception: pass
+        
+        if 'Name' not in constituents_df_for_live.columns:
+            inst_names = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict() if not st.session_state["instruments_df"].empty else {}
+            constituents_df_for_live['Name'] = constituents_df_for_live['symbol'].map(inst_names).fillna(constituents_df_for_live['symbol'])
+
+        constituents_df_for_live["Last Price"] = constituents_df_for_live["symbol"].map(live_quotes)
+        constituents_df_for_live["Weighted Price"] = constituents_df_for_live["Last Price"] * constituents_df_for_live["Weights"]
+        current_live_value_for_factsheet_display = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
+
+        display_single_index_details("Newly Calculated Index", constituents_df_for_live, current_calculated_index_history_df, index_id="new_index")
+        
+        st.markdown("---")
+        st.subheader("Save Newly Created Index")
+        index_name_to_save = st.text_input("Enter a unique name for this index to save it:", value="MyCustomIndex", key="new_index_save_name")
+        if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
+            if index_name_to_save and st.session_state["user_id"]:
+                try:
+                    with st.spinner("Saving index..."):
+                        check_response = supabase_client.table("custom_indexes").select("id").eq("user_id", st.session_state["user_id"]).eq("index_name", index_name_to_save).execute()
+                        if check_response.data:
+                            st.warning(f"An index named '{index_name_to_save}' already exists. Please choose a different name.")
+                        else:
+                            history_df_to_save = current_calculated_index_history_df.reset_index()
+                            history_df_to_save['date'] = history_df_to_save['date'].dt.strftime('%Y-%m-%dT%H:%M:%S') 
+
+                            index_data = {
+                                "user_id": st.session_state["user_id"],
+                                "index_name": index_name_to_save,
+                                "constituents": current_calculated_index_data_df[['symbol', 'Name', 'Weights']].to_dict(orient='records'),
+                                "historical_performance": history_df_to_save.to_dict(orient='records')
+                            }
+                            supabase_client.table("custom_indexes").insert(index_data).execute()
+                            st.success(f"Index '{index_name_to_save}' saved successfully!")
+                            st.session_state["saved_indexes"] = [] 
+                            st.session_state["current_calculated_index_data"] = pd.DataFrame()
+                            st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                            st.session_state["factsheet_selected_constituents_index_names"] = []
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Error saving new index: {e}")
+            else:
+                st.warning("Please enter an index name and ensure you are logged into Supabase.")
+    
+    st.markdown("---")
+    st.subheader("2. Load & Manage Saved Indexes")
+    if st.button("Load My Indexes from DB", key="load_my_indexes_db_btn"):
+        try:
+            with st.spinner("Loading indexes..."):
+                response = supabase_client.table("custom_indexes").select("id, index_name, constituents, historical_performance").eq("user_id", st.session_state["user_id"]).execute()
+            if response.data:
+                st.session_state["saved_indexes"] = response.data
+                st.success(f"Loaded {len(response.data)} indexes.")
+            else:
+                st.session_state["saved_indexes"] = []
+                st.info("No saved indexes found for your account.")
+        except Exception as e: st.error(f"Error loading indexes: {e}")
+    
+    saved_indexes = st.session_state.get("saved_indexes", [])
+    if saved_indexes:
+        index_names_from_db = [idx['index_name'] for idx in saved_indexes]
+        
+        selected_custom_indexes_names = st.multiselect(
+            "Select saved custom indexes to include in comparison:", 
+            options=index_names_from_db, 
+            key="select_saved_indexes_for_comparison"
+        )
+
+        st.markdown("---")
+        st.subheader("3. Configure & Run Multi-Index & Benchmark Comparison")
+        
+        col_comp_dates, col_comp_bench, col_comp_mode = st.columns(3)
+        with col_comp_dates:
+            comparison_start_date = st.date_input("Comparison Start Date", value=datetime.now().date() - timedelta(days=365), key="comparison_start_date")
+            comparison_end_date = st.date_input("Comparison End Date", value=datetime.now().date(), key="comparison_end_date")
+            if comparison_start_date >= comparison_end_date:
+                st.error("Comparison start date must be before end date.")
+                comparison_start_date = datetime.now().date() - timedelta(days=365)
+                comparison_end_date = datetime.now().date()
+
+        with col_comp_bench:
+            benchmark_symbols_str = st.text_area(
+                f"Enter External Benchmark Symbols (comma-separated, {BENCHMARK_SYMBOL} is automatically used for Alpha/Beta)",
+                value=f"{BENCHMARK_SYMBOL}, NIFTY BANK",
+                height=80,
+                key="comparison_benchmark_symbols_input"
+            )
+            external_benchmark_symbols = [s.strip().upper() for s in benchmark_symbols_str.split(',') if s.strip()]
+            comparison_exchange = st.selectbox("Exchange for External Benchmarks", ["NSE", "BSE", "NFO"], key="comparison_bench_exchange_select")
+        
+        with col_comp_mode:
+            use_normalized_values = st.radio(
+                "Calculation Mode",
+                options=[True, False],
+                format_func=lambda x: "Normalized to 100" if x else "Real Values",
+                index=0,
+                key="comparison_calc_mode",
+                help="Normalized: All values start at 100 for easy comparison. Real: Actual weighted prices based on constituents."
+            )
+            st.session_state["use_normalized_comparison"] = use_normalized_values
+            
+        risk_free_rate = st.number_input("Risk-Free Rate (%) for Ratios (e.g., 6.0)", min_value=0.0, max_value=20.0, value=6.0, step=0.1)
+
+        if st.button("Run Multi-Index & Benchmark Comparison", key="run_multi_comparison_btn"):
+            if not selected_custom_indexes_names and not external_benchmark_symbols:
+                st.warning("Please select at least one custom index or enter at least one benchmark symbol for comparison.")
+            else:
+                all_comparison_data = {}
+                all_performance_metrics = {}
+                
+                benchmark_returns = None
+                with st.spinner(f"Fetching primary benchmark ({BENCHMARK_SYMBOL}) for risk ratios..."):
+                    benchmark_df = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, comparison_start_date, comparison_end_date, "day", "NSE")
+                    if "_error" in benchmark_df.columns:
+                        st.warning(f"Could not fetch primary benchmark '{BENCHMARK_SYMBOL}'. Risk ratios will be N/A. Error: {benchmark_df.loc[0, '_error']}")
+                        st.session_state["benchmark_historical_data"] = pd.DataFrame()
+                    else:
+                        benchmark_returns = benchmark_df['close'].pct_change().dropna() 
+                        st.session_state["benchmark_historical_data"] = benchmark_df
+                
+                if st.session_state["instruments_df"].empty:
+                    with st.spinner("Loading instruments for comparison lookup..."):
+                        st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+                
+                if "_error" in st.session_state["instruments_df"].columns:
+                    st.error(f"Failed to load instruments for comparison lookup: {st.session_state['instruments_df'].loc[0, '_error']}")
+                    return
+
+                comparison_items = selected_custom_indexes_names + external_benchmark_symbols
+                
+                for item_name in comparison_items:
+                    data_type = "custom_index" if item_name in selected_custom_indexes_names else "benchmark"
+                    constituents_df = None
+                    symbol = None
+                    exchange = comparison_exchange
+                    
+                    if data_type == "custom_index":
+                        db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == item_name), None)
+                        if db_index_data: constituents_df = pd.DataFrame(db_index_data['constituents'])
+                    else:
+                        symbol = item_name
+
+                    with st.spinner(f"Processing {item_name} data..."):
+                        result_df = _fetch_and_normalize_data_for_comparison(
+                            name=item_name, data_type=data_type, comparison_start_date=comparison_start_date,
+                            comparison_end_date=comparison_end_date, constituents_df=constituents_df,
+                            symbol=symbol, exchange=exchange, api_key=api_key, access_token=access_token,
+                            use_normalized=use_normalized_values
+                        )
+                    
+                    if "_error" not in result_df.columns:
+                        if use_normalized_values:
+                            all_comparison_data[item_name] = result_df['normalized_value']
+                            asset_daily_returns_decimal = result_df['raw_values'].pct_change().dropna()
+                        else:
+                            all_comparison_data[item_name] = result_df['value']
+                            asset_daily_returns_decimal = result_df['value'].pct_change().dropna()
+                        
+                        all_performance_metrics[item_name] = calculate_performance_metrics(
+                            asset_daily_returns_decimal, 
+                            risk_free_rate=risk_free_rate, 
+                            benchmark_returns=benchmark_returns
+                        )
+                    else:
+                        st.error(f"Error processing {item_name}: {result_df.loc[0, '_error']}")
+
+                if all_comparison_data:
+                    combined_comparison_df = pd.DataFrame(all_comparison_data)
+                    combined_comparison_df.dropna(how='all', inplace=True)
+                    
+                    if not combined_comparison_df.empty:
+                        st.session_state["last_comparison_df"] = combined_comparison_df
+                        st.session_state["last_comparison_metrics"] = all_performance_metrics
+                        
+                        # Calculate risk metrics
+                        risk_metrics = calculate_risk_metrics(combined_comparison_df, benchmark_returns)
+                        st.session_state["last_risk_metrics"] = risk_metrics
+                        
+                        st.success("Comparison data generated successfully.")
+                    else:
+                        st.warning("No common or sufficient data found for comparison. Please check selected indexes/benchmarks and date range.")
+                else:
+                    st.info("No data selected or fetched for comparison.")
+
+        last_comparison_df = st.session_state.get("last_comparison_df", pd.DataFrame())
+
+        if not last_comparison_df.empty:
+            st.markdown("#### Cumulative Performance Comparison")
+            fig_comparison = go.Figure()
+            for col in last_comparison_df.columns:
+                fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
+            
+            chart_title = "Multi-Index & Benchmark Performance"
+            y_axis_title = "Normalized Value (Base 100)" if use_normalized_values else "Value"
+
+            fig_comparison.update_layout(
+                title_text=chart_title,
+                xaxis_title="Date",
+                yaxis_title=y_axis_title,
+                height=600,
+                template="plotly_dark",
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_comparison, use_container_width=True)
+
+            st.download_button(
+                label="Download Comparison Performance Data (CSV)",
+                data=last_comparison_df.to_csv().encode('utf-8'),
+                file_name=f"Comparison_Performance_Data.csv",
+                mime="text/csv",
+                key="download_comparison_performance_csv"
+            )
+
+            st.markdown("#### Performance Metrics Summary")
+            metrics_df = pd.DataFrame(st.session_state["last_comparison_metrics"]).T
+            st.dataframe(metrics_df.style.format("{:.4f}", na_rep="N/A"), use_container_width=True) 
+            
+            st.download_button(
+                label="Download Performance Metrics (CSV)",
+                data=metrics_df.to_csv().encode('utf-8'),
+                file_name="Comparison_Performance_Metrics.csv",
+                mime="text/csv",
+                key="download_comparison_metrics_csv"
+            )
+
+            st.markdown("#### Risk Analysis Charts")
+            risk_c1, risk_c2 = st.columns(2)
+            with risk_c1:
+                st.plotly_chart(plot_drawdown_chart(last_comparison_df), use_container_width=True)
+            with risk_c2:
+                st.plotly_chart(plot_rolling_volatility_chart(last_comparison_df), use_container_width=True)
+
+            if not st.session_state["benchmark_historical_data"].empty:
+                 benchmark_returns_for_rolling = st.session_state["benchmark_historical_data"]['close'].pct_change().dropna()
+                 
+                 if not benchmark_returns_for_rolling.empty:
+                     beta_chart, corr_chart = plot_rolling_risk_charts(last_comparison_df, benchmark_returns_for_rolling, window=60)
+                     
+                     st.markdown("##### Rolling Relative Metrics (60-Day Window)")
+                     rel_c1, rel_c2 = st.columns(2)
+                     with rel_c1:
+                         if beta_chart.data: st.plotly_chart(beta_chart, use_container_width=True)
+                         else: st.info(f"Not enough common data points for rolling beta calculation.")
+                     with rel_c2:
+                         if corr_chart.data: st.plotly_chart(corr_chart, use_container_width=True)
+                         else: st.info(f"Not enough common data points for rolling correlation calculation.")
+
+            # Display Risk Metrics Summary
+            st.markdown("#### Risk Metrics Summary")
+            last_risk_metrics = st.session_state.get("last_risk_metrics", {})
+            if last_risk_metrics:
+                risk_metrics_df = pd.DataFrame(last_risk_metrics).T
+                st.dataframe(risk_metrics_df.style.format("{:.4f}", na_rep="N/A"), use_container_width=True)
+                
+                st.download_button(
+                    label="Download Risk Metrics (CSV)",
+                    data=risk_metrics_df.to_csv().encode('utf-8'),
+                    file_name="Comparison_Risk_Metrics.csv",
+                    mime="text/csv",
+                    key="download_risk_metrics_csv"
+                )
+            else:
+                st.info("Risk metrics will appear after running a comparison.")
+
+        st.markdown("---")
+        st.subheader("5. Generate and Download Consolidated Factsheet")
+        st.info("This will generate a factsheet. If a new index is calculated or a single saved index is selected, it will create a detailed report for that index. Otherwise, it will generate a comparison-only factsheet if comparison data is available.")
+        
+        factsheet_constituents_df_final = pd.DataFrame()
+        factsheet_history_df_final = pd.DataFrame()
+        factsheet_index_name_final = "Consolidated Report"
+        current_live_value_for_factsheet_final = 0.0
+        
+        available_constituents_for_factsheet = ["None"]
+        if not current_calculated_index_data_df.empty: available_constituents_for_factsheet.append("Newly Calculated Index")
+        if saved_indexes: available_constituents_for_factsheet.extend(index_names_from_db)
+        
+        st.markdown("---")
+        st.subheader("Factsheet Content Selection")
+        
+        selected_constituents_for_factsheet = st.multiselect(
+            "Select which custom index(es) constituents and live value to include in the factsheet:",
+            options=available_constituents_for_factsheet,
+            default=st.session_state.get("factsheet_selected_constituents_index_names", []),
+            key="factsheet_constituents_selector"
+        )
+        st.session_state["factsheet_selected_constituents_index_names"] = selected_constituents_for_factsheet
+
+        all_constituents_dfs = []
+        
+        if selected_constituents_for_factsheet and "None" not in selected_constituents_for_factsheet:
+            if "Newly Calculated Index" in selected_constituents_for_factsheet and not current_calculated_index_data_df.empty:
+                all_constituents_dfs.append(current_calculated_index_data_df.copy())
+            
+            for index_name in selected_constituents_for_factsheet:
+                if index_name == "Newly Calculated Index": continue
+                selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == index_name), None)
+                if selected_db_index_data:
+                    all_constituents_dfs.append(pd.DataFrame(selected_db_index_data['constituents']).copy())
+
+            if all_constituents_dfs:
+                factsheet_constituents_df_final = pd.concat(all_constituents_dfs, ignore_index=True)
+                factsheet_constituents_df_final = factsheet_constituents_df_final.groupby(['symbol', 'Name'])['Weights'].sum().reset_index()
+                factsheet_constituents_df_final['Weights'] = factsheet_constituents_df_final['Weights'] / factsheet_constituents_df_final['Weights'].sum()
+
+                if len(selected_constituents_for_factsheet) == 1:
+                    factsheet_index_name_final = selected_constituents_for_factsheet[0]
+                    if factsheet_index_name_final == "Newly Calculated Index":
+                         factsheet_history_df_final = current_calculated_index_history_df.copy()
+                    else:
+                        db_data = next((idx for idx in saved_indexes if idx['index_name'] == factsheet_index_name_final), None)
+                        if db_data and db_data.get('historical_performance'):
+                            history_from_db = pd.DataFrame(db_data['historical_performance'])
+                            if not history_from_db.empty:
+                                history_from_db['date'] = pd.to_datetime(history_from_db['date'])
+                                history_from_db.set_index('date', inplace=True)
+                                history_from_db.sort_index(inplace=True)
+                                factsheet_history_df_final = history_from_db
+                else:
+                    factsheet_index_name_final = "Combined Index Constituents Report"
+
+                live_quotes_for_factsheet_final = {}
+                symbols_for_ltp_for_factsheet_final = [sym for sym in factsheet_constituents_df_final["symbol"]]
+                if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet_final:
+                    try:
+                        kc_client = get_authenticated_kite_client(api_key, access_token)
+                        if kc_client:
+                            instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet_final]
+                            ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
+                            for sym in symbols_for_ltp_for_factsheet_final:
+                                key = f"{DEFAULT_EXCHANGE}:{sym}"
+                                live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
+                    except Exception as e:
+                        st.warning(f"Error fetching batch LTP for factsheet live value: {e}. Live prices might be partial.")
+                
+                if 'Name' not in factsheet_constituents_df_final.columns and not st.session_state["instruments_df"].empty:
+                    instrument_names_for_factsheet_final = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
+                    factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol'].map(instrument_names_for_factsheet_final).fillna(factsheet_constituents_df_final['symbol'])
+                elif 'Name' not in factsheet_constituents_df_final.columns:
+                    factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol']
+
+                factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
+                factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
+                current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
+            else:
+                factsheet_constituents_df_final = pd.DataFrame()
+                factsheet_history_df_final = pd.DataFrame()
+                factsheet_index_name_final = "Comparison Report" if not last_comparison_df.empty else "Consolidated Report"
+                current_live_value_for_factsheet_final = 0.0
+        else:
+            factsheet_constituents_df_final = pd.DataFrame()
+            factsheet_history_df_final = pd.DataFrame()
+            factsheet_index_name_final = "Comparison Report" if not last_comparison_df.empty else "Consolidated Report"
+            current_live_value_for_factsheet_final = 0.0
+
+        ai_agent_snippet_input = st.text_area(
+            "Optional: Paste HTML snippet for an embedded AI Agent (e.g., iframe code)",
+            height=150,
+            key="ai_agent_embed_snippet_input",
+            value="" 
+        )
+
+        col_factsheet_download_options_1, col_factsheet_download_options_2 = st.columns(2)
+
+        with col_factsheet_download_options_1:
+            if st.button("Generate & Download Factsheet (CSV)", key="generate_download_factsheet_csv_btn"):
+                if not factsheet_constituents_df_final.empty or not factsheet_history_df_final.empty or not last_comparison_df.empty:
+                    factsheet_csv_content = generate_factsheet_csv_content(
+                        factsheet_constituents_df_final=factsheet_constituents_df_final,
+                        factsheet_history_df_final=factsheet_history_df_final,
+                        last_comparison_df=last_comparison_df,
+                        last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
+                        current_live_value=current_live_value_for_factsheet_final,
+                        index_name=factsheet_index_name_final,
+                        ai_agent_embed_snippet=None,
+                        use_normalized=st.session_state.get("use_normalized_comparison", True)
+                    )
+                    st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
+                    st.download_button(
+                        label="Download CSV Factsheet",
+                        data=st.session_state["last_facts_data"],
+                        file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key="factsheet_download_button_final_csv_trigger",
+                        help="Includes constituents, historical data, comparison data, and metrics."
+                    )
+                    st.success("CSV Factsheet generated and ready for download!")
+                else:
+                    st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+
+        with col_factsheet_download_options_2:
+            if st.button("Generate & Download Factsheet (HTML/PDF)", key="generate_download_factsheet_html_btn"):
+                if not factsheet_constituents_df_final.empty or not factsheet_history_df_final.empty or not last_comparison_df.empty:
+                    factsheet_html_content = generate_factsheet_html_content(
+                        factsheet_constituents_df_final=factsheet_constituents_df_final,
+                        factsheet_history_df_final=factsheet_history_df_final,
+                        last_comparison_df=last_comparison_df,
+                        last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
+                        current_live_value=current_live_value_for_factsheet_final,
+                        index_name=factsheet_index_name_final,
+                        ai_agent_embed_snippet=ai_agent_snippet_input if ai_agent_snippet_input.strip() else None,
+                        use_normalized=st.session_state.get("use_normalized_comparison", True)
+                    )
+                    st.session_state["last_factsheet_html_data"] = factsheet_html_content.encode('utf-8')
+
+                    st.download_button(
+                        label="Download HTML Factsheet",
+                        data=st.session_state["last_factsheet_html_data"],
+                        file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+                        mime="text/html",
+                        key="factsheet_download_button_final_html_trigger",
+                        help="Includes charts for performance and composition, and optional embedded AI agent. Open in browser to Print to PDF."
+                    )
+                    st.success("HTML Factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
+                else:
+                    st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+
+        st.markdown("---")
+        st.subheader("6. View/Delete Individual Saved Indexes")
+        
+        index_names_from_db_for_selector = [idx['index_name'] for idx in saved_indexes] if saved_indexes else []
+
+        selected_index_to_manage = st.selectbox(
+            "Select a single saved index to view details or delete:", 
+            ["--- Select ---"] + index_names_from_db_for_selector, 
+            key="select_single_saved_index_to_manage"
+        )
+
+        selected_db_index_data = None
+        if selected_index_to_manage != "--- Select ---":
+            selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
+            if selected_db_index_data:
+                loaded_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
+
+                loaded_historical_df = pd.DataFrame()
+                is_recalculated_live = False
+
+                if loaded_historical_performance_raw:
+                    try:
+                        loaded_historical_df = pd.DataFrame(loaded_historical_performance_raw)
+                        loaded_historical_df['date'] = pd.to_datetime(loaded_historical_df['date'])
+                        loaded_historical_df.set_index('date', inplace=True)
+                        loaded_historical_df.sort_index(inplace=True)
+                        if loaded_historical_df.empty or 'index_value' not in loaded_historical_df.columns:
+                            raise ValueError("Loaded historical data is invalid.")
+                    except Exception:
+                        st.warning(f"Saved historical data for '{selected_index_to_manage}' is invalid or outdated. Attempting live recalculation for display...")
+                        loaded_historical_df = pd.DataFrame()
+
+                if loaded_historical_df.empty:
+                    min_date = (datetime.now().date() - timedelta(days=365))
+                    max_date = datetime.now().date()
+                    recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
+                    
+                    if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
+                        loaded_historical_df = recalculated_historical_df
+                        is_recalculated_live = True
+                        st.success("Historical data recalculated live successfully.")
+                    else:
+                        st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', ['Unknown error'])}")
+
+                display_single_index_details(selected_index_to_manage, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'], is_recalculated_live)
+                
+                st.markdown("---")
+                if st.button(f"Delete Index '{selected_index_to_manage}'", key=f"delete_index_{selected_db_index_data['id']}", type="primary"):
+                    try:
+                        supabase_client.table("custom_indexes").delete().eq("id", selected_db_index_data['id']).execute()
+                        st.success(f"Index '{selected_index_to_manage}' deleted successfully.")
+                        st.session_state["saved_indexes"] = []
+                        st.rerun()
+                    except Exception as e: st.error(f"Error deleting index: {e}")
+    else:
+        st.info("No saved indexes to manage yet. Load them using the button above.")
+
+def render_index_price_calc_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("⚡ Live Index Price Calculator")
+    st.markdown("Upload a CSV file with symbols and their weights to calculate a real-time index value based on the Last Traded Price (LTP).")
+
+    if not kite_client:
+        st.info("Please login to Kite Connect first to fetch live prices.")
+        return
+
+    st.subheader("1. Upload Constituents CSV")
+    uploaded_file = st.file_uploader(
+        "Upload a CSV file",
+        type="csv",
+        help="The CSV must have two columns: 'Symbol' and 'Weights'."
+    )
+
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            df.columns = [col.strip().lower() for col in df.columns]
+
+            if 'symbol' in df.columns and 'weights' in df.columns:
+                df['symbol'] = df['symbol'].str.strip().str.upper()
+                df['weights'] = pd.to_numeric(df['weights'], errors='coerce')
+                df.dropna(subset=['symbol', 'weights'], inplace=True)
+                
+                df.rename(columns={'symbol': 'Symbol', 'weights': 'Weights'}, inplace=True)
+                
+                st.session_state.index_price_calc_df = df
+                st.success(f"Successfully loaded {len(df)} valid symbols from {uploaded_file.name}.")
+            else:
+                st.error("CSV file must contain 'Symbol' and 'Weights' columns (case-insensitive).")
+                st.session_state.index_price_calc_df = pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error processing CSV file: {e}")
+            st.session_state.index_price_calc_df = pd.DataFrame()
+
+    df_constituents = st.session_state.get("index_price_calc_df", pd.DataFrame())
+    
+    if not df_constituents.empty:
+        st.subheader("2. Review Constituents")
+        st.dataframe(df_constituents, use_container_width=True)
+
+        st.subheader("3. Calculate Index Price")
+        if st.button("Calculate/Refresh Index Price", type="primary"):
+            with st.spinner("Fetching live prices and calculating index value..."):
+                symbols = df_constituents['Symbol'].tolist()
+                instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols]
+
+                try:
+                    ltp_data = kite_client.ltp(instrument_identifiers)
+
+                    prices = {}
+                    for sym in symbols:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        if key in ltp_data and ltp_data[key].get('last_price') is not None:
+                            prices[sym] = ltp_data[key]['last_price']
+                        else:
+                            prices[sym] = np.nan
+
+                    df_results = df_constituents.copy()
+                    df_results['LTP'] = df_results['Symbol'].map(prices)
+                    
+                    df_results['Weighted Price'] = df_results['LTP'] * df_results['Weights']
+
+                    failed_symbols = df_results[df_results['LTP'].isna()]['Symbol'].tolist()
+                    if failed_symbols:
+                        st.warning(f"Could not fetch LTP for the following symbols: {', '.join(failed_symbols)}. They will be excluded from the calculation.")
+                    
+                    final_index_price = df_results['Weighted Price'].sum()
+
+                    st.subheader("Calculation Results")
+                    st.dataframe(df_results.style.format({
+                        "Weights": "{:.4f}",
+                        "LTP": "₹{:,.2f}",
+                        "Weighted Price": "₹{:,.2f}"
+                    }), use_container_width=True)
+                    
+                    st.metric(label="Final Calculated Index Price", value=f"₹ {final_index_price:,.2f}")
+
+                except Exception as e:
+                    st.error(f"An error occurred while fetching prices: {e}")
+
+
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+with tab_custom_index: 
+    render_custom_index_tab(k, supabase, api_key, access_token)
+with tab_index_price_calc:
+    render_index_price_calc_tab(k, api_key, access_token)import streamlit as st
 import pandas as pd
 import json
 import re
