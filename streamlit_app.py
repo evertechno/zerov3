@@ -188,6 +188,7 @@ def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = 
     return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
 
 
+# FIXED: Corrected VaR and CVaR calculation (removed incorrect sqrt scaling)
 def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.0, benchmark_returns: pd.Series = None) -> dict:
     """
     Calculates comprehensive performance metrics including risk-adjusted ratios and CAPM metrics.
@@ -232,6 +233,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
 
     calmar_ratio = (annualized_return / 100) / abs(max_drawdown / 100) if max_drawdown != 0 and not np.isnan(max_drawdown) else np.nan
 
+    # FIXED: VaR and CVaR - Report daily values, not incorrectly annualized
     confidence_level = 0.05
     var_daily = -daily_returns_decimal.quantile(confidence_level) * 100  # Daily VaR as percentage
     
@@ -343,11 +345,7 @@ def calculate_risk_metrics(df: pd.DataFrame, benchmark_returns: pd.Series = None
                 
                 # Correlation
                 corr = aligned_returns.corr(aligned_bench)
-                    
                 metrics[col]["Correlation"] = round(corr, 4)
-            else:
-                metrics[col]["Avg Beta"] = np.nan
-                metrics[col]["Correlation"] = np.nan
     
     return metrics
 
@@ -389,6 +387,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
 
     combined_closes = pd.DataFrame(all_historical_closes)
     
+    # FIXED: Removed bfill which could cause lookahead bias
     combined_closes = combined_closes.ffill()
     combined_closes.dropna(how='all', inplace=True)
 
@@ -943,37 +942,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.plotly_chart(fig_pie, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("Historical Performance")
-        if not index_history_df.empty:
-            st.dataframe(index_history_df.style.format({
-                "index_value": "{:,.2f}",
-                "raw_value": "₹{:,.2f}"
-            }), use_container_width=True)
-
-            fig_hist = go.Figure()
-            fig_hist.add_trace(go.Scatter(x=index_history_df.index, y=index_history_df['index_value'], mode='lines', name=f'{index_name} (Normalized)'))
-            fig_hist.add_trace(go.Scatter(x=index_history_df.index, y=index_history_df['raw_value'], mode='lines', name=f'{index_name} (Raw Value)', yaxis='y2'))
-            fig_hist.update_layout(
-                title_text=f"{index_name} Historical Performance",
-                xaxis_title="Date",
-                yaxis_title="Normalized Value (Base 100)",
-                height=500,
-                template="plotly_dark",
-                hovermode="x unified",
-                yaxis2=dict(
-                    title="Raw Index Value (₹)",
-                    overlaying="y",
-                    side="right",
-                    showgrid=False
-                )
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
-
-            csv_history = index_history_df.to_csv().encode('utf-8')
-            st.download_button(label="Download Historical Performance to CSV", data=csv_history, file_name=f"{index_name}_historical_performance.csv", mime="text/csv", key=f"export_history_{index_id or index_name}")
-        else:
-            st.info("No historical data to display or export for this index. Ensure the date range for calculation is valid.")
-
+        st.subheader("Export Options")
+        col_export1, col_export2 = st.columns(2)
+        with col_export2:
+            if not index_history_df.empty:
+                csv_history = index_history_df.to_csv().encode('utf-8')
+                st.download_button(label="Export Historical Performance to CSV", data=csv_history, file_name=f"{index_name}_historical_performance.csv", mime="text/csv", key=f"export_history_{index_id or index_name}")
+            else: st.info("No historical data to export for this index.")
 
     st.markdown("---")
     st.subheader("1. Create New Index")
@@ -1647,4 +1622,3 @@ with tab_custom_index:
     render_custom_index_tab(k, supabase, api_key, access_token)
 with tab_index_price_calc:
     render_index_price_calc_tab(k, api_key, access_token)
-
