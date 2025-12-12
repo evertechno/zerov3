@@ -18,7 +18,8 @@ from supabase import create_client, Client
 from kiteconnect import KiteConnect
 
 # --- Streamlit Page Configuration ---
-st.set_page_page(page_title="Invsion Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
+# CORRECTED: Changed st.set_page_page to st.set_page_config
+st.set_page_config(page_title="Invsion Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -417,9 +418,9 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
 
     if index_type == "Price Weighted":
         # Sum of prices of all constituents, divided by a capitalization_factor (divisor)
-        # If 'Capitalization Factor' column exists in constituents_df, it's typically for individual stock splits/adjustments
-        # which would require a more complex time-series of factors per stock.
-        # For simplicity, here we apply a single global 'capitalization_factor' as the index divisor.
+        # We assume `capitalization_factor` is a single global divisor for the index.
+        # If per-stock factors are needed, constituents_df would need a 'factor' column
+        # and a more complex calculation involving initial values.
         index_history_series = combined_prices.sum(axis=1) / capitalization_factor
             
     elif index_type in ["Equal Weighted", "User Defined Weights", "Value Weighted"]:
@@ -1181,10 +1182,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             on='symbol', how='left'
                         )
                         processed_df['Capitalization Factor'] = pd.to_numeric(processed_df['Capitalization Factor'], errors='coerce').fillna(1.0)
-                        # The capitalization_factor in current_index_config_temp will be for overall divisor.
-                        # Per-stock capitalization factors will be handled if `Capitalization Factor` column exists in constituents_df directly.
-                        # For now, if a global factor is needed, user must set it manually below.
-                        st.info("If 'Capitalization Factor' column is present, its values will be used per symbol for price weighting. Otherwise, a global factor will be used if configured.")
+                        st.info("If 'Capitalization Factor' column is present, its values will be used per symbol for price weighting. Otherwise, a global factor will be used if configured below.")
 
                 elif selected_index_type == "Equal Weighted":
                     required_cols = {"Symbol"}
@@ -1544,9 +1542,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             # Ensure constituents_df has 'symbol', 'Name', 'Weights' and 'Capitalization Factor' if Price Weighted
                             constituents_to_save = current_calculated_index_data_df.copy()
                             if current_index_creation_config.get("index_type") == "Price Weighted" and 'Capitalization Factor' not in constituents_to_save.columns:
-                                # Add a dummy Capitalization Factor if not present in the original CSV upload
+                                # Add Capitalization Factor column to constituents_to_save if it's Price Weighted and not already present
                                 constituents_to_save['Capitalization Factor'] = current_index_creation_config.get("capitalization_factor", 1.0)
                                 constituents_to_save.drop(columns=['Weights'], inplace=True, errors='ignore') # Weights are not relevant for Price Weighted beyond initial setup
+                            elif current_index_creation_config.get("index_type") != "Price Weighted" and 'Capitalization Factor' in constituents_to_save.columns:
+                                # Remove Capitalization Factor if it's not a Price Weighted index
+                                constituents_to_save.drop(columns=['Capitalization Factor'], inplace=True, errors='ignore')
+
 
                             index_data = {
                                 "user_id": st.session_state["user_id"],
@@ -1835,25 +1837,36 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 
                 # Handle potential duplicate symbols and ensure weights/factors are correct
                 if "Capitalization Factor" in factsheet_constituents_df_final.columns:
-                    # For Price Weighted, sum of inv. factors. This part is tricky if merging different types.
-                    # Best to handle this for single index factsheets only, or simplify merged view.
-                    # For a consolidated report, we might just sum symbols and average weights/factors.
-                    # For simplicity, if 'Capitalization Factor' exists, assume 'Weights' are not primary and vice-versa.
-                    # If multiple index types are selected, this consolidation logic needs careful design.
-                    # For now, if 'Capitalization Factor' is present, it's a Price Weighted focus.
-                    factsheet_constituents_df_final = factsheet_constituents_df_final.groupby(['symbol', 'Name'])[['Weights', 'Capitalization Factor']].sum().reset_index()
-                    factsheet_constituents_df_final['Weights'] = factsheet_constituents_df_final['Weights'] / factsheet_constituents_df_final['Weights'].sum() if factsheet_constituents_df_final['Weights'].sum() != 0 else factsheet_constituents_df_final['Weights']
-                    factsheet_constituents_df_final['Capitalization Factor'] = factsheet_constituents_df_final['Capitalization Factor'].replace(0, np.nan).mean() # A simplified approach for merging
-                else:
-                    # Standard merging for weighted indexes
+                    # If 'Capitalization Factor' exists, it implies a Price Weighted component or mix.
+                    # For a consolidated report with mixed index types, this logic can get very complex.
+                    # Simplification: if 'Capitalization Factor' is present, we prioritize it for Price Weighted logic.
+                    # Otherwise, we use 'Weights' and ensure they are normalized if applicable.
+                    
+                    # For factsheet display, if 'Capitalization Factor' exists, fill NaN Weights for display purposes.
+                    # For actual live value calculation below, the specific index_config will be used.
+                    if 'Weights' not in factsheet_constituents_df_final.columns:
+                        factsheet_constituents_df_final['Weights'] = 1.0 # Placeholder
+                    
+                    # If multiple price-weighted components were merged, sum factors if they represent individual divisors
+                    # For simplicity, if present, we'll try to represent both, or clearly indicate logic.
+                    # Here, if a global factor is needed, we'll use one from a single index config.
+                    
+                    # Grouping for display purposes is more straightforward
+                    factsheet_constituents_df_final = factsheet_constituents_df_final.groupby(['symbol', 'Name']).agg({
+                        'Weights': 'sum', 
+                        'Capitalization Factor': 'mean' # Average if multiple entries, or first valid.
+                    }).reset_index()
+                    # Re-normalize Weights if they're meant to be proportional and are present
+                    if factsheet_constituents_df_final['Weights'].sum() != 0:
+                        factsheet_constituents_df_final['Weights'] = factsheet_constituents_df_final['Weights'] / factsheet_constituents_df_final['Weights'].sum()
+
+                else: # No 'Capitalization Factor' column, implies all are weighted indexes
                     factsheet_constituents_df_final = factsheet_constituents_df_final.groupby(['symbol', 'Name'])['Weights'].sum().reset_index()
                     if factsheet_constituents_df_final['Weights'].sum() != 0:
                         factsheet_constituents_df_final['Weights'] = factsheet_constituents_df_final['Weights'] / factsheet_constituents_df_final['Weights'].sum()
 
 
-                # Default config for factsheet in case of multiple selections or issues
-                factsheet_config_for_live_calc = {"index_type": "User Defined Weights", "capitalization_factor": 1.0, "base_value": 100.0, "price_source": "close"}
-
+                # Determine index config for live value calc based on selection
                 if len(selected_constituents_for_factsheet) == 1:
                     factsheet_index_name_final = selected_constituents_for_factsheet[0]
                     if factsheet_index_name_final == "Newly Calculated Index":
@@ -1872,6 +1885,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 else: # Multiple custom indexes selected, or just "Combined Index Constituents Report"
                     factsheet_index_name_final = "Combined Index Constituents Report"
                     # For multiple selections, config is generalized. Will default to user-defined weights behavior.
+                    # This means the live calculation will treat the combined constituents as a single "User Defined Weights" index.
                     factsheet_index_config_final = {"index_type": "User Defined Weights", "capitalization_factor": 1.0, "base_value": 100.0, "price_source": "close"}
 
 
@@ -1897,16 +1911,25 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
                 factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
                 
-                # Calculate live value based on index type
+                # Calculate live value based on the determined index type for the factsheet
                 if factsheet_index_config_final.get("index_type") == "Price Weighted":
                     df_for_live_pw_factsheet = factsheet_constituents_df_final[factsheet_constituents_df_final['Last Price'].notna()].copy()
-                    # Use individual Capitalization Factor from df if present, otherwise global from config
-                    if 'Capitalization Factor' in df_for_live_pw_factsheet.columns:
+                    
+                    # Get capitalization factor: prioritize from df if present, then from config
+                    cap_factor_col_exists = 'Capitalization Factor' in df_for_live_pw_factsheet.columns
+                    
+                    if cap_factor_col_exists:
+                         # Simple sum of prices, then divide by the sum of factors if they are per-stock multipliers
+                         # OR, if individual Capitalization Factors act as inverse divisors, sum (Price / Factor)
+                         # Assuming 'Capitalization Factor' means the divisor value for *that stock*
                         df_for_live_pw_factsheet['Adjusted Price'] = df_for_live_pw_factsheet['Last Price'] / df_for_live_pw_factsheet['Capitalization Factor']
+                        current_live_value_for_factsheet_final = df_for_live_pw_factsheet['Adjusted Price'].sum()
                     else:
+                        # Use the global capitalization_factor for the entire index
                         cap_factor = factsheet_index_config_final.get("capitalization_factor", 1.0)
                         df_for_live_pw_factsheet['Adjusted Price'] = df_for_live_pw_factsheet['Last Price'] / cap_factor
-                    current_live_value_for_factsheet_final = df_for_live_pw_factsheet['Adjusted Price'].sum()
+                        current_live_value_for_factsheet_final = df_for_live_pw_factsheet['Adjusted Price'].sum()
+
                     factsheet_constituents_df_final['Weighted Price'] = df_for_live_pw_factsheet['Adjusted Price']
                 else: # All other weighted types
                     factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
