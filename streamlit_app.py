@@ -18,7 +18,7 @@ from supabase import create_client, Client
 from kiteconnect import KiteConnect
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="Invsion Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
+st.set_page_page(page_title="Invsion Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -43,7 +43,7 @@ if "last_comparison_metrics" not in st.session_state: st.session_state["last_com
 if "last_facts_data" not in st.session_state: st.session_state["last_facts_data"] = None
 if "last_factsheet_html_data" not in st.session_state: st.session_state["last_factsheet_html_data"] = None
 if "current_market_data" not in st.session_state: st.session_state["current_market_data"] = None
-if "holdings_data" not in st.session_state: st.session_state["holdings_data"] = None
+if "holdings_data" not in st.session_state: st.session_state["holdings_data"] = pd.DataFrame()
 if "benchmark_historical_data" not in st.session_state: st.session_state["benchmark_historical_data"] = pd.DataFrame()
 if "factsheet_selected_constituents_index_names" not in st.session_state: st.session_state["factsheet_selected_constituents_index_names"] = []
 if "index_price_calc_df" not in st.session_state: st.session_state["index_price_calc_df"] = pd.DataFrame()
@@ -219,7 +219,6 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
 
     cumulative_returns = (1 + daily_returns_decimal).cumprod() - 1
     total_return = cumulative_returns.iloc[-1] * 100 if not cumulative_returns.empty else 0
-    # num_periods = len(daily_returns_decimal) # Not directly used for annualized_return calculation below
 
     if len(daily_returns_decimal) > 0 and (1 + daily_returns_decimal > 0).all():
         geometric_mean_daily_return = np.expm1(np.log1p(daily_returns_decimal).mean())
@@ -417,26 +416,13 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     index_history_series = pd.Series(dtype=float)
 
     if index_type == "Price Weighted":
-        # Ensure capitalization_factor is applied correctly. If constituents_df has individual factors, use them.
-        # Otherwise, use the overall capitalization_factor provided.
-        if 'Capitalization Factor' in constituents_df.columns:
-            # Merge factors with prices. This implies factor is per-stock.
-            merged_prices_factors = combined_prices.merge(
-                constituents_df[['symbol', 'Capitalization Factor']].set_index('symbol'), 
-                left_index=True, right_index=False, left_on=combined_prices.columns, right_index=True, how='left' # This merge logic needs review for per-stock factor.
-            )
-            # A more robust approach for per-stock factor in a Price Weighted index
-            # requires calculating a 'divisor' based on initial market value / initial index value.
-            # For simplicity, if 'Capitalization Factor' is per stock, we can sum prices / sum factors.
-            # If it's a single divisor for the whole index (common for Price Weighted), we just sum prices.
-
-            # Assuming capitalization_factor is a single divisor for the entire index (like Dow Jones)
-            index_history_series = combined_prices.sum(axis=1) / capitalization_factor
-        else:
-            # If no individual 'Capitalization Factor' column, use the global one as a divisor
-            index_history_series = combined_prices.sum(axis=1) / capitalization_factor
-
-    elif index_type == "Equal Weighted" or index_type == "User Defined Weights" or index_type == "Value Weighted":
+        # Sum of prices of all constituents, divided by a capitalization_factor (divisor)
+        # If 'Capitalization Factor' column exists in constituents_df, it's typically for individual stock splits/adjustments
+        # which would require a more complex time-series of factors per stock.
+        # For simplicity, here we apply a single global 'capitalization_factor' as the index divisor.
+        index_history_series = combined_prices.sum(axis=1) / capitalization_factor
+            
+    elif index_type in ["Equal Weighted", "User Defined Weights", "Value Weighted"]:
         # For these, 'Weights' column in constituents_df is crucial
         if 'Weights' not in constituents_df.columns:
             return pd.DataFrame({"_error": [f"'Weights' column is required for {index_type} index type."]})
@@ -450,7 +436,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         aligned_prices = combined_prices[common_symbols]
         aligned_weights = weights_series[common_symbols]
 
-        # Ensure weights are applied correctly. If not already normalized to 1, do so.
+        # Ensure weights are applied correctly. For Equal/User Defined, they are normalized to 1.
         if index_type in ["Equal Weighted", "User Defined Weights"] and aligned_weights.sum() != 0:
             aligned_weights = aligned_weights / aligned_weights.sum()
         
@@ -2018,14 +2004,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             if selected_db_index_data:
                 # Ensure the constituents data from DB has expected columns
                 loaded_constituents_df_raw = selected_db_index_data['constituents']
-                loaded_constituents_df = pd.DataFrame(loaded_constituents_df_raw)
+                loaded_constituits_df = pd.DataFrame(loaded_constituents_df_raw)
                 
                 # Ensure 'Weights' column exists for display in display_single_index_details for all types
-                if 'Weights' not in loaded_constituents_df.columns:
-                    if loaded_index_config.get("index_type") == "Price Weighted" and 'Capitalization Factor' in loaded_constituents_df.columns:
-                        loaded_constituents_df['Weights'] = 1.0 # Placeholder for display
+                if 'Weights' not in loaded_constituits_df.columns:
+                    if loaded_index_config.get("index_type") == "Price Weighted" and 'Capitalization Factor' in loaded_constituits_df.columns:
+                        loaded_constituits_df['Weights'] = 1.0 # Placeholder for display
                     else:
-                        loaded_constituents_df['Weights'] = 0.0 # Default if no meaningful weight
+                        loaded_constituits_df['Weights'] = 0.0 # Default if no meaningful weight
 
                 loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
                 loaded_index_config = selected_db_index_data.get('index_config', {})
@@ -2049,7 +2035,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
                     recalculated_historical_df = _calculate_historical_index_value(
-                        api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE,
+                        api_key, access_token, loaded_constituits_df, min_date, max_date, DEFAULT_EXCHANGE,
                         price_source=loaded_index_config.get("price_source", "close"),
                         index_type=loaded_index_config.get("index_type", "User Defined Weights"),
                         capitalization_factor=loaded_index_config.get("capitalization_factor", 1.0),
@@ -2064,7 +2050,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     else:
                         st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', ['Unknown error'])}")
 
-                display_single_index_details(selected_index_to_manage, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'], is_recalculated_live, index_creation_config=loaded_index_config)
+                display_single_index_details(selected_index_to_manage, loaded_constituits_df, loaded_historical_df, selected_db_index_data['id'], is_recalculated_live, index_creation_config=loaded_index_config)
                 
                 st.markdown("---")
                 if st.button(f"Delete Index '{selected_index_to_manage}'", key=f"delete_index_{selected_db_index_data['id']}", type="primary"):
@@ -2254,4 +2240,3 @@ with tab_custom_index:
     render_custom_index_tab(k, supabase, api_key, access_token)
 with tab_index_price_calc:
     render_index_price_calc_tab(k, api_key, access_token)
-
